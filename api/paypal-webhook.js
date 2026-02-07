@@ -1,14 +1,10 @@
 // api/paypal-webhook.js
 
-function h(req, name) {
+function header(req, name) {
   const key = name.toLowerCase();
-  return req.headers?.[key] ?? null;
-}
-
-function mustEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+  const v = req.headers?.[key] ?? req.headers?.[name];
+  // Vercel/Node normalmente lo da como string; por seguridad lo normalizamos
+  return Array.isArray(v) ? v[0] : (v || "");
 }
 
 async function readEvent(req) {
@@ -21,16 +17,13 @@ async function readEvent(req) {
   return raw ? JSON.parse(raw) : null;
 }
 
-function paypalBaseUrl() {
-  const env = (process.env.PAYPAL_ENV || "sandbox").toLowerCase();
-  // Acepta "live" o "production"
-  if (env === "live" || env === "production") return "https://api-m.paypal.com";
-  return "https://api-m.sandbox.paypal.com";
+function env(name, fallback = "") {
+  return (process.env[name] ?? fallback).toString().trim();
 }
 
 async function paypalToken(baseUrl) {
-  const clientId = mustEnv("PAYPAL_CLIENT_ID");
-  const secret = mustEnv("PAYPAL_SECRET");
+  const clientId = env("PAYPAL_CLIENT_ID");
+  const secret = env("PAYPAL_SECRET");
 
   const basic = Buffer.from(`${clientId}:${secret}`).toString("base64");
 
@@ -45,45 +38,18 @@ async function paypalToken(baseUrl) {
 
   const text = await r.text();
   console.log("paypalToken:", r.status, text.slice(0, 200));
-  if (!r.ok) throw new Error(`paypal token error: ${r.status} ${text.slice(0, 200)}`);
-
+  if (!r.ok) throw new Error(`paypal token error: ${r.status}`);
   return JSON.parse(text).access_token;
 }
 
-/**
- * PRUEBA DEFINITIVA:
- * Confirma que PAYPAL_WEBHOOK_ID pertenece al MISMO APP/ENTORNO de tu token.
- */
-async function assertWebhookIdBelongsToThisApp(baseUrl, accessToken, webhookId) {
-  const r = await fetch(`${baseUrl}/v1/notifications/webhooks/${encodeURIComponent(webhookId)}`, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-  });
-
-  const text = await r.text();
-  console.log("get-webhook:", r.status, text.slice(0, 250));
-
-  if (!r.ok) {
-    throw new Error(
-      `PAYPAL_WEBHOOK_ID not found for these credentials (status ${r.status}). ` +
-      `This means webhook_id is from another App or another environment.`
-    );
-  }
-}
-
 async function verifyWebhook(baseUrl, accessToken, req, event) {
-  const webhookId = mustEnv("PAYPAL_WEBHOOK_ID");
-
   const payload = {
-    auth_algo: h(req, "paypal-auth-algo"),
-    cert_url: h(req, "paypal-cert-url"),
-    transmission_id: h(req, "paypal-transmission-id"),
-    transmission_sig: h(req, "paypal-transmission-sig"),
-    transmission_time: h(req, "paypal-transmission-time"),
-    webhook_id: webhookId,
+    auth_algo: header(req, "paypal-auth-algo"),
+    cert_url: header(req, "paypal-cert-url"),
+    transmission_id: header(req, "paypal-transmission-id"),
+    transmission_sig: header(req, "paypal-transmission-sig"),
+    transmission_time: header(req, "paypal-transmission-time"),
+    webhook_id: env("PAYPAL_WEBHOOK_ID"),
     webhook_event: event,
   };
 
@@ -91,9 +57,16 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
     .filter(([k, v]) => k !== "webhook_event" && !v)
     .map(([k]) => k);
 
-  if (missing.length) {
-    console.log("Missing verify fields:", missing);
-  }
+  // Logs CLAVE para cazar el fallo
+  console.log("verify payload summary:", {
+    missing,
+    auth_algo: payload.auth_algo,
+    cert_url_present: !!payload.cert_url,
+    transmission_id_present: !!payload.transmission_id,
+    transmission_time_present: !!payload.transmission_time,
+    transmission_sig_len: (payload.transmission_sig || "").length,
+    webhook_id: payload.webhook_id,
+  });
 
   const r = await fetch(`${baseUrl}/v1/notifications/verify-webhook-signature`, {
     method: "POST",
@@ -105,26 +78,26 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
   });
 
   const text = await r.text();
-  console.log("verify-webhook-signature:", r.status, text.slice(0, 300));
+  console.log("verify-webhook-signature:", r.status, text.slice(0, 500));
 
-  if (!r.ok) return { ok: false, httpStatus: r.status, raw: text };
+  if (!r.ok) return { ok: false, status: r.status, body: text };
 
   const data = JSON.parse(text);
-  return { ok: data.verification_status === "SUCCESS", data };
+  return { ok: data.verification_status === "SUCCESS", data, status: r.status, body: text };
 }
 
 async function sendEmailResend({ to, orderId }) {
-  const apiKey = mustEnv("RESEND_API_KEY");
-  const from = mustEnv("MAIL_FROM");
+  const mailFrom = env("MAIL_FROM");
+  if (!mailFrom) throw new Error("MAIL_FROM is missing");
 
   const r = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${env("RESEND_API_KEY")}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from,                 // <- aquí decides el FROM
+      from: mailFrom,
       to,
       subject: `Pedido confirmado — en preparación (#${orderId})`,
       text: `Hola,
@@ -134,17 +107,24 @@ Nº pedido: ${orderId}
 
 Te avisaremos cuando salga enviado con su seguimiento.
 Support — Scoot Shop`,
-      reply_to: "support@scootshop.co",
+      // Resend usa replyTo (camelCase). :contentReference[oaicite:2]{index=2}
+      replyTo: "support@scootshop.co",
     }),
   });
 
   const text = await r.text();
-  console.log("resend:", r.status, text.slice(0, 200));
-  if (!r.ok) throw new Error(`resend send error: ${r.status} ${text.slice(0, 200)}`);
+  console.log("resend:", r.status, text.slice(0, 300));
+  if (!r.ok) throw new Error(`resend send error: ${r.status}`);
 }
 
 module.exports = async (req, res) => {
   try {
+    // Evita ruido de GET /, favicon, etc.
+    if (req.method === "GET") {
+      res.statusCode = 200;
+      return res.end("ok");
+    }
+
     if (req.method !== "POST") {
       res.statusCode = 405;
       return res.end("Method Not Allowed");
@@ -156,45 +136,43 @@ module.exports = async (req, res) => {
       return res.end("Missing body");
     }
 
-    const baseUrl = paypalBaseUrl();
     console.log("event_type:", event.event_type);
-    console.log("paypal_env:", process.env.PAYPAL_ENV, "baseUrl:", baseUrl);
+
+    const paypalEnv = env("PAYPAL_ENV", "sandbox").toLowerCase();
+    const baseUrl =
+      paypalEnv === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
+
+    console.log("paypal_env:", paypalEnv, "baseUrl:", baseUrl);
 
     const token = await paypalToken(baseUrl);
 
-    // 🔥 PRUEBA DEFINITIVA: si aquí peta, tienes webhook_id de otro App/entorno.
-    await assertWebhookIdBelongsToThisApp(baseUrl, token, mustEnv("PAYPAL_WEBHOOK_ID"));
-
     const verify = await verifyWebhook(baseUrl, token, req, event);
+
+    // Recomendación práctica mientras depuras:
+    // devuelve 200 aunque falle la verificación, para que PayPal no reintente en bucle,
+    // pero NO envíes email si no verifica.
     if (!verify.ok) {
-      res.statusCode = 400;
+      res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
       return res.end(
         JSON.stringify({
           ok: false,
           reason: "Invalid signature",
-          verification_status: verify.data?.verification_status,
+          verification_status: verify?.data?.verification_status,
         })
       );
     }
 
-    // Email (no bloquea el 200 si falla, para no “romper” PayPal)
-    let emailSent = false;
-    const toEmail = process.env.TEST_EMAIL_TO;
+    const toEmail = env("TEST_EMAIL_TO");
     if (toEmail) {
-      try {
-        await sendEmailResend({ to: toEmail, orderId: event?.resource?.id || event?.id || "—" });
-        emailSent = true;
-      } catch (e) {
-        console.log("Email error:", e?.message || e);
-      }
+      await sendEmailResend({ to: toEmail, orderId: event?.id || "—" });
     } else {
       console.log("TEST_EMAIL_TO not set; skipping email send.");
     }
 
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: true, emailSent }));
+    return res.end(JSON.stringify({ ok: true }));
   } catch (e) {
     console.log("Server error:", e?.message || e);
     res.statusCode = 500;
