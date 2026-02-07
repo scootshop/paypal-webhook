@@ -1,42 +1,38 @@
 // api/paypal-webhook.js
-// Reemplaza TODO el archivo por este.
-//
-// Qué debes ajustar (solo variables en Vercel):
-// - PAYPAL_ENV = "live"
-// - PAYPAL_CLIENT_ID = (LIVE)
-// - PAYPAL_SECRET = (LIVE)
-// - PAYPAL_WEBHOOK_ID = (LIVE)  <-- del webhook creado en LIVE para ESTA URL
-// - RESEND_API_KEY
-// - MAIL_FROM  (ej: Scoot Shop <support@scootshop.co>)
-// - TEST_EMAIL_TO (tu email real para la prueba)
 
 function h(req, name) {
-  // PayPal envía headers con nombres exactos; en Node vienen en minúsculas
-  return req.headers[name.toLowerCase()];
+  const key = name.toLowerCase();
+  return req.headers?.[key] ?? null;
+}
+
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
 
 async function readEvent(req) {
   // Si algún runtime ya trae body parseado
-  if (req.body) {
-    if (typeof req.body === "string") return JSON.parse(req.body);
-    return req.body;
-  }
+  if (req.body) return typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
   const chunks = [];
-  for await (const c of req) {
-    chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
-  }
+  for await (const c of req) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
   const raw = Buffer.concat(chunks).toString("utf8");
   return raw ? JSON.parse(raw) : null;
 }
 
+function paypalBaseUrl() {
+  const env = (process.env.PAYPAL_ENV || "sandbox").toLowerCase();
+  // Acepta "live" o "production"
+  if (env === "live" || env === "production") return "https://api-m.paypal.com";
+  return "https://api-m.sandbox.paypal.com";
+}
+
 async function paypalToken(baseUrl) {
-  const client = process.env.PAYPAL_CLIENT_ID;
-  const secret = process.env.PAYPAL_SECRET;
+  const clientId = mustEnv("PAYPAL_CLIENT_ID");
+  const secret = mustEnv("PAYPAL_SECRET");
 
-  if (!client || !secret) throw new Error("Missing PAYPAL_CLIENT_ID or PAYPAL_SECRET");
-
-  const basic = Buffer.from(`${client}:${secret}`).toString("base64");
+  const basic = Buffer.from(`${clientId}:${secret}`).toString("base64");
 
   const r = await fetch(`${baseUrl}/v1/oauth2/token`, {
     method: "POST",
@@ -49,21 +45,37 @@ async function paypalToken(baseUrl) {
 
   const text = await r.text();
   console.log("paypalToken:", r.status, text.slice(0, 200));
-  if (!r.ok) throw new Error(`paypal token error: ${r.status}`);
+  if (!r.ok) throw new Error(`paypal token error: ${r.status} ${text.slice(0, 200)}`);
 
   return JSON.parse(text).access_token;
 }
 
-function pickBaseUrl() {
-  const env = (process.env.PAYPAL_ENV || "sandbox").toLowerCase();
-  return env === "sandbox"
-    ? "https://api-m.sandbox.paypal.com"
-    : "https://api-m.paypal.com";
+/**
+ * PRUEBA DEFINITIVA:
+ * Confirma que PAYPAL_WEBHOOK_ID pertenece al MISMO APP/ENTORNO de tu token.
+ */
+async function assertWebhookIdBelongsToThisApp(baseUrl, accessToken, webhookId) {
+  const r = await fetch(`${baseUrl}/v1/notifications/webhooks/${encodeURIComponent(webhookId)}`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  const text = await r.text();
+  console.log("get-webhook:", r.status, text.slice(0, 250));
+
+  if (!r.ok) {
+    throw new Error(
+      `PAYPAL_WEBHOOK_ID not found for these credentials (status ${r.status}). ` +
+      `This means webhook_id is from another App or another environment.`
+    );
+  }
 }
 
 async function verifyWebhook(baseUrl, accessToken, req, event) {
-  const webhookId = process.env.PAYPAL_WEBHOOK_ID;
-  if (!webhookId) throw new Error("Missing PAYPAL_WEBHOOK_ID");
+  const webhookId = mustEnv("PAYPAL_WEBHOOK_ID");
 
   const payload = {
     auth_algo: h(req, "paypal-auth-algo"),
@@ -75,14 +87,12 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
     webhook_event: event,
   };
 
-  // Debug claro si faltan headers (si disparas desde navegador o Postman sin headers, fallará)
   const missing = Object.entries(payload)
     .filter(([k, v]) => k !== "webhook_event" && !v)
     .map(([k]) => k);
 
   if (missing.length) {
-    console.log("Missing PayPal headers for signature verify:", missing);
-    // Esto suele pasar si NO viene de PayPal (ej: test manual).
+    console.log("Missing verify fields:", missing);
   }
 
   const r = await fetch(`${baseUrl}/v1/notifications/verify-webhook-signature`, {
@@ -95,28 +105,17 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
   });
 
   const text = await r.text();
-  console.log("verify-webhook-signature:", r.status, text.slice(0, 500));
+  console.log("verify-webhook-signature:", r.status, text.slice(0, 300));
 
-  if (!r.ok) {
-    return { ok: false, httpStatus: r.status, raw: text, verification_status: null };
-  }
+  if (!r.ok) return { ok: false, httpStatus: r.status, raw: text };
 
   const data = JSON.parse(text);
-  return {
-    ok: data.verification_status === "SUCCESS",
-    httpStatus: r.status,
-    verification_status: data.verification_status,
-    raw: text,
-  };
+  return { ok: data.verification_status === "SUCCESS", data };
 }
 
-async function sendEmailResend({ to, orderId, eventType }) {
-  const apiKey = process.env.RESEND_API_KEY;
-  const from = process.env.MAIL_FROM;
-
-  if (!apiKey) throw new Error("Missing RESEND_API_KEY");
-  if (!from) throw new Error("Missing MAIL_FROM");
-  if (!to) throw new Error("Missing recipient email");
+async function sendEmailResend({ to, orderId }) {
+  const apiKey = mustEnv("RESEND_API_KEY");
+  const from = mustEnv("MAIL_FROM");
 
   const r = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -125,26 +124,23 @@ async function sendEmailResend({ to, orderId, eventType }) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from,
+      from,                 // <- aquí decides el FROM
       to,
-      subject: `Pago recibido — prueba real (#{${orderId}})`,
+      subject: `Pedido confirmado — en preparación (#${orderId})`,
       text: `Hola,
-Este es un email de prueba.
+Hemos recibido tu pago correctamente. Tu pedido está confirmado y ya está en preparación.
 
-Evento: ${eventType}
-Order/Resource ID: ${orderId}
+Nº pedido: ${orderId}
 
-Si has recibido esto, el webhook + Resend funcionan.
-Scoot Shop`,
+Te avisaremos cuando salga enviado con su seguimiento.
+Support — Scoot Shop`,
       reply_to: "support@scootshop.co",
     }),
   });
 
   const text = await r.text();
-  console.log("resend:", r.status, text.slice(0, 300));
+  console.log("resend:", r.status, text.slice(0, 200));
   if (!r.ok) throw new Error(`resend send error: ${r.status} ${text.slice(0, 200)}`);
-
-  return text;
 }
 
 module.exports = async (req, res) => {
@@ -160,18 +156,16 @@ module.exports = async (req, res) => {
       return res.end("Missing body");
     }
 
-    const eventType = event.event_type || "unknown";
-    console.log("event_type:", eventType);
+    const baseUrl = paypalBaseUrl();
+    console.log("event_type:", event.event_type);
+    console.log("paypal_env:", process.env.PAYPAL_ENV, "baseUrl:", baseUrl);
 
-    const baseUrl = pickBaseUrl();
-    console.log("paypal_env:", (process.env.PAYPAL_ENV || "sandbox"), "baseUrl:", baseUrl);
-
-    // 1) Token
     const token = await paypalToken(baseUrl);
 
-    // 2) Verificación firma (esto es lo que te estaba devolviendo FAILURE)
-    const verify = await verifyWebhook(baseUrl, token, req, event);
+    // 🔥 PRUEBA DEFINITIVA: si aquí peta, tienes webhook_id de otro App/entorno.
+    await assertWebhookIdBelongsToThisApp(baseUrl, token, mustEnv("PAYPAL_WEBHOOK_ID"));
 
+    const verify = await verifyWebhook(baseUrl, token, req, event);
     if (!verify.ok) {
       res.statusCode = 400;
       res.setHeader("Content-Type", "application/json");
@@ -179,34 +173,30 @@ module.exports = async (req, res) => {
         JSON.stringify({
           ok: false,
           reason: "Invalid signature",
-          verification_status: verify.verification_status,
-          verify_http_status: verify.httpStatus,
-          // Importante: si aquí sale FAILURE, es porque PAYPAL_WEBHOOK_ID no corresponde al webhook
-          // LIVE que PayPal está usando para firmar este evento.
-          verify_raw: (verify.raw || "").slice(0, 500),
+          verification_status: verify.data?.verification_status,
         })
       );
     }
 
-    // 3) Enviar email de prueba SIEMPRE (para confirmar funcionamiento)
+    // Email (no bloquea el 200 si falla, para no “romper” PayPal)
+    let emailSent = false;
     const toEmail = process.env.TEST_EMAIL_TO;
-    if (!toEmail) {
-      console.log("TEST_EMAIL_TO not set; skipping email send.");
+    if (toEmail) {
+      try {
+        await sendEmailResend({ to: toEmail, orderId: event?.resource?.id || event?.id || "—" });
+        emailSent = true;
+      } catch (e) {
+        console.log("Email error:", e?.message || e);
+      }
     } else {
-      const idForEmail =
-        event?.resource?.id ||
-        event?.id ||
-        event?.resource?.supplementary_data?.related_ids?.order_id ||
-        "—";
-
-      await sendEmailResend({ to: toEmail, orderId: idForEmail, eventType });
+      console.log("TEST_EMAIL_TO not set; skipping email send.");
     }
 
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: true }));
+    return res.end(JSON.stringify({ ok: true, emailSent }));
   } catch (e) {
-    console.log("Server error:", e?.stack || e?.message || e);
+    console.log("Server error:", e?.message || e);
     res.statusCode = 500;
     return res.end("Server error");
   }
