@@ -1,34 +1,23 @@
 // api/paypal-webhook.js
-// Webhook PayPal -> verifica firma -> (opcional) obtiene order -> envía email con Resend
-// No pongas keys aquí: todo va por variables de entorno en Vercel.
 
 function h(req, name) {
   return req.headers[name.toLowerCase()];
 }
 
-async function readJson(req) {
+async function readEvent(req) {
+  // Por si algún runtime ya trae body parseado
+  if (req.body) return typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
   const chunks = [];
-  for await (const c of req) chunks.push(c);
+  for await (const c of req) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
   const raw = Buffer.concat(chunks).toString("utf8");
   return raw ? JSON.parse(raw) : null;
 }
 
-function paypalBaseUrl() {
-  const env = (process.env.PAYPAL_ENV || "sandbox").toLowerCase();
-  return env === "sandbox"
-    ? "https://api-m.sandbox.paypal.com"
-    : "https://api-m.paypal.com";
-}
-
 async function paypalToken(baseUrl) {
-  const clientId = process.env.PAYPAL_CLIENT_ID;
-  const secret = process.env.PAYPAL_SECRET;
-
-  if (!clientId || !secret) {
-    throw new Error("Missing PAYPAL_CLIENT_ID or PAYPAL_SECRET");
-  }
-
-  const basic = Buffer.from(`${clientId}:${secret}`).toString("base64");
+  const basic = Buffer.from(
+    `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_SECRET}`
+  ).toString("base64");
 
   const r = await fetch(`${baseUrl}/v1/oauth2/token`, {
     method: "POST",
@@ -39,28 +28,30 @@ async function paypalToken(baseUrl) {
     body: "grant_type=client_credentials",
   });
 
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`PayPal token error (${r.status}): ${t}`);
-  }
-
-  const data = await r.json();
-  return data.access_token;
+  const text = await r.text();
+  console.log("paypalToken:", r.status, text.slice(0, 200));
+  if (!r.ok) throw new Error(`paypal token error: ${r.status}`);
+  return JSON.parse(text).access_token;
 }
 
 async function verifyWebhook(baseUrl, accessToken, req, event) {
-  const webhookId = process.env.PAYPAL_WEBHOOK_ID;
-  if (!webhookId) throw new Error("Missing PAYPAL_WEBHOOK_ID");
-
   const payload = {
     auth_algo: h(req, "paypal-auth-algo"),
     cert_url: h(req, "paypal-cert-url"),
     transmission_id: h(req, "paypal-transmission-id"),
     transmission_sig: h(req, "paypal-transmission-sig"),
     transmission_time: h(req, "paypal-transmission-time"),
-    webhook_id: webhookId,
+    webhook_id: process.env.PAYPAL_WEBHOOK_ID,
     webhook_event: event,
   };
+
+  const missing = Object.entries(payload)
+    .filter(([k, v]) => k !== "webhook_event" && !v)
+    .map(([k]) => k);
+
+  if (missing.length) {
+    console.log("Missing verify fields:", missing);
+  }
 
   const r = await fetch(`${baseUrl}/v1/notifications/verify-webhook-signature`, {
     method: "POST",
@@ -71,81 +62,41 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
     body: JSON.stringify(payload),
   });
 
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`Verify signature error (${r.status}): ${t}`);
-  }
+  const text = await r.text();
+  console.log("verify-webhook-signature:", r.status, text.slice(0, 500));
 
-  const data = await r.json();
-  return data.verification_status === "SUCCESS";
-}
+  if (!r.ok) return { ok: false, status: r.status, body: text };
 
-function getOrderUrl(baseUrl, event) {
-  // A veces el webhook trae link "up" al pedido
-  const links = event?.resource?.links || [];
-  const up = links.find((l) => l?.rel === "up" && l?.href);
-  if (up?.href) return up.href;
-
-  // Alternativa: order_id relacionado
-  const orderId = event?.resource?.supplementary_data?.related_ids?.order_id;
-  if (orderId) return `${baseUrl}/v2/checkout/orders/${orderId}`;
-
-  return null;
-}
-
-async function fetchOrder(orderUrl, accessToken) {
-  const r = await fetch(orderUrl, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`Order fetch error (${r.status}): ${t}`);
-  }
-
-  return r.json();
+  const data = JSON.parse(text);
+  return { ok: data.verification_status === "SUCCESS", data };
 }
 
 async function sendEmailResend({ to, orderId }) {
-  const apiKey = process.env.RESEND_API_KEY;
-  const from = process.env.MAIL_FROM;
-
-  if (!apiKey) throw new Error("Missing RESEND_API_KEY");
-  if (!from) throw new Error("Missing MAIL_FROM");
-  if (!to) throw new Error("Missing recipient email (to)");
-
-  const replyTo = process.env.MAIL_REPLY_TO || "support@scootshop.co";
-
   const r = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from, // "Scoot Shop <support@scootshop.co>"
+      from: process.env.MAIL_FROM,
       to,
       subject: `Pedido confirmado — en preparación (#${orderId})`,
-      text:
-`Hola,
+      text: `Hola,
 Hemos recibido tu pago correctamente. Tu pedido está confirmado y ya está en preparación.
 
 Nº pedido: ${orderId}
 
 Te avisaremos cuando salga enviado con su seguimiento.
 Support — Scoot Shop`,
-      reply_to: replyTo,
+      reply_to: "support@scootshop.co",
     }),
   });
 
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`Resend error (${r.status}): ${t}`);
-  }
+  const text = await r.text();
+  console.log("resend:", r.status, text.slice(0, 300));
+  if (!r.ok) throw new Error(`resend send error: ${r.status}`);
 }
-
-// Idempotencia básica (no persistente).
-const processedEventIds = new Set();
 
 module.exports = async (req, res) => {
   try {
@@ -154,70 +105,48 @@ module.exports = async (req, res) => {
       return res.end("Method Not Allowed");
     }
 
-    const event = await readJson(req);
+    const event = await readEvent(req);
     if (!event) {
       res.statusCode = 400;
       return res.end("Missing body");
     }
 
-    if (event.id && processedEventIds.has(event.id)) {
-      res.statusCode = 200;
-      return res.end("OK (duplicate ignored)");
-    }
+    console.log("event_type:", event.event_type);
 
-    const baseUrl = paypalBaseUrl();
+    const env = (process.env.PAYPAL_ENV || "sandbox").toLowerCase();
+    const baseUrl =
+      env === "sandbox" ? "https://api-m.sandbox.paypal.com" : "https://api-m.paypal.com";
+
     const token = await paypalToken(baseUrl);
 
-    const signatureOk = await verifyWebhook(baseUrl, token, req, event);
-    if (!signatureOk) {
+    const verify = await verifyWebhook(baseUrl, token, req, event);
+    if (!verify.ok) {
       res.statusCode = 400;
-      return res.end("Invalid signature");
+      res.setHeader("Content-Type", "application/json");
+      return res.end(
+        JSON.stringify({
+          ok: false,
+          reason: "Invalid signature",
+          verifyStatus: verify.status,
+          verifyBody: (verify.body || "").slice(0, 500),
+        })
+      );
     }
 
-    if (event.id) processedEventIds.add(event.id);
+    // Para pruebas: fuerza siempre a tu email real si existe
+    const toEmail = process.env.TEST_EMAIL_TO;
 
-    // Solo actuamos cuando el pago se completa
-    if (event.event_type === "PAYMENT.CAPTURE.COMPLETED") {
-      const orderUrl = getOrderUrl(baseUrl, event);
-
-      // Fallback de orderId si no podemos obtener el pedido
-      let buyerEmail = null;
-      let orderId =
-        event?.resource?.supplementary_data?.related_ids?.order_id ||
-        event?.resource?.id ||
-        "—";
-
-      // Si hay URL/ID de pedido, intentamos obtener email real del pagador
-      if (orderUrl) {
-        const order = await fetchOrder(orderUrl, token);
-        buyerEmail = order?.payer?.email_address || null;
-        orderId = order?.id || orderId;
-      }
-
-      // Para Sandbox: envía a tu correo real si defines TEST_EMAIL_TO en Vercel
-      const to = process.env.TEST_EMAIL_TO || buyerEmail;
-
-      console.log("WEBHOOK:", {
-        event_type: event.event_type,
-        orderUrl,
-        buyerEmail,
-        to,
-        orderId,
-      });
-
-      if (to) {
-        await sendEmailResend({ to, orderId });
-      } else {
-        console.log("No recipient email found; email not sent.");
-      }
+    if (toEmail) {
+      await sendEmailResend({ to: toEmail, orderId: event?.id || "—" });
     } else {
-      console.log("Ignored event_type:", event.event_type);
+      console.log("TEST_EMAIL_TO not set; skipping email send.");
     }
 
     res.statusCode = 200;
-    return res.end("OK");
+    res.setHeader("Content-Type", "application/json");
+    return res.end(JSON.stringify({ ok: true }));
   } catch (e) {
-    console.error("Webhook error:", e?.message || e);
+    console.log("Server error:", e?.message || e);
     res.statusCode = 500;
     return res.end("Server error");
   }
