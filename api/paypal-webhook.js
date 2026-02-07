@@ -1,11 +1,12 @@
 // api/paypal-webhook.js
+// Webhook PayPal -> verifica firma -> (opcional) obtiene order -> envía email con Resend
+// No pongas keys aquí: todo va por variables de entorno en Vercel.
 
 function h(req, name) {
   return req.headers[name.toLowerCase()];
 }
 
 async function readJson(req) {
-  // Lee el body como JSON (sin depender de parsers)
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString("utf8");
@@ -51,7 +52,6 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
   const webhookId = process.env.PAYPAL_WEBHOOK_ID;
   if (!webhookId) throw new Error("Missing PAYPAL_WEBHOOK_ID");
 
-  // Verificación oficial de la firma del webhook
   const payload = {
     auth_algo: h(req, "paypal-auth-algo"),
     cert_url: h(req, "paypal-cert-url"),
@@ -81,12 +81,12 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
 }
 
 function getOrderUrl(baseUrl, event) {
-  // A veces el evento trae link "up" al pedido
+  // A veces el webhook trae link "up" al pedido
   const links = event?.resource?.links || [];
   const up = links.find((l) => l?.rel === "up" && l?.href);
   if (up?.href) return up.href;
 
-  // Alternativa: related order id
+  // Alternativa: order_id relacionado
   const orderId = event?.resource?.supplementary_data?.related_ids?.order_id;
   if (orderId) return `${baseUrl}/v2/checkout/orders/${orderId}`;
 
@@ -123,7 +123,7 @@ async function sendEmailResend({ to, orderId }) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from, // Ej: "Scoot Shop <support@scootshop.co>"
+      from, // "Scoot Shop <support@scootshop.co>"
       to,
       subject: `Pedido confirmado — en preparación (#${orderId})`,
       text:
@@ -144,7 +144,7 @@ Support — Scoot Shop`,
   }
 }
 
-// Idempotencia básica (no persistente). En producción usar BD/Redis.
+// Idempotencia básica (no persistente).
 const processedEventIds = new Set();
 
 module.exports = async (req, res) => {
@@ -160,7 +160,6 @@ module.exports = async (req, res) => {
       return res.end("Missing body");
     }
 
-    // Evita duplicados si PayPal reintenta (limitado en serverless)
     if (event.id && processedEventIds.has(event.id)) {
       res.statusCode = 200;
       return res.end("OK (duplicate ignored)");
@@ -169,36 +168,50 @@ module.exports = async (req, res) => {
     const baseUrl = paypalBaseUrl();
     const token = await paypalToken(baseUrl);
 
-    const ok = await verifyWebhook(baseUrl, token, req, event);
-    if (!ok) {
+    const signatureOk = await verifyWebhook(baseUrl, token, req, event);
+    if (!signatureOk) {
       res.statusCode = 400;
       return res.end("Invalid signature");
     }
 
     if (event.id) processedEventIds.add(event.id);
 
-    // Solo actuamos en pago completado
+    // Solo actuamos cuando el pago se completa
     if (event.event_type === "PAYMENT.CAPTURE.COMPLETED") {
       const orderUrl = getOrderUrl(baseUrl, event);
 
+      // Fallback de orderId si no podemos obtener el pedido
       let buyerEmail = null;
-      let orderId = "—";
+      let orderId =
+        event?.resource?.supplementary_data?.related_ids?.order_id ||
+        event?.resource?.id ||
+        "—";
 
+      // Si hay URL/ID de pedido, intentamos obtener email real del pagador
       if (orderUrl) {
         const order = await fetchOrder(orderUrl, token);
         buyerEmail = order?.payer?.email_address || null;
         orderId = order?.id || orderId;
       }
 
-      // Para pruebas: si defines TEST_EMAIL_TO, se envía ahí (útil en Sandbox)
+      // Para Sandbox: envía a tu correo real si defines TEST_EMAIL_TO en Vercel
       const to = process.env.TEST_EMAIL_TO || buyerEmail;
+
+      console.log("WEBHOOK:", {
+        event_type: event.event_type,
+        orderUrl,
+        buyerEmail,
+        to,
+        orderId,
+      });
 
       if (to) {
         await sendEmailResend({ to, orderId });
       } else {
-        // Si no hay email, no fallamos el webhook; solo lo registramos.
-        console.log("No recipient email found (buyerEmail empty). orderUrl:", orderUrl);
+        console.log("No recipient email found; email not sent.");
       }
+    } else {
+      console.log("Ignored event_type:", event.event_type);
     }
 
     res.statusCode = 200;
