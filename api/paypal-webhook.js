@@ -111,7 +111,7 @@ module.exports = async (req, res) => {
       return res.end("Missing body");
     }
 
-    const env = (process.env.PAYPAL_ENV || "live").toLowerCase();
+    const env = (process.env.PAYPAL_ENV || "sandbox").toLowerCase();
     const baseUrl =
       env === "sandbox"
         ? "https://api-m.sandbox.paypal.com"
