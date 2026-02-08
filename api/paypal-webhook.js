@@ -12,6 +12,7 @@ async function readEvent(req) {
   const raw = Buffer.concat(chunks).toString("utf8");
   return raw ? JSON.parse(raw) : null;
 }
+const { sendEmailResend } = require("../lib/email");
 
 async function paypalToken(baseUrl) {
   const basic = Buffer.from(
