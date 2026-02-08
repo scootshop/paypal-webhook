@@ -1,10 +1,15 @@
 // api/paypal-webhook.js
+// Webhook PayPal (verifica firma) → obtiene email comprador → envía email PRO con Resend (logo + HTML)
+// Requiere: lib/email.js exportando sendEmailResend(...)
+
+const { sendEmailResend } = require("../lib/email");
 
 function h(req, name) {
   return req.headers[name.toLowerCase()];
 }
 
 async function readEvent(req) {
+  // Vercel/Node: a veces req.body ya viene parseado, otras hay que leer stream
   if (req.body) return typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
   const chunks = [];
@@ -12,7 +17,6 @@ async function readEvent(req) {
   const raw = Buffer.concat(chunks).toString("utf8");
   return raw ? JSON.parse(raw) : null;
 }
-const { sendEmailResend } = require("../lib/email");
 
 async function paypalToken(baseUrl) {
   const basic = Buffer.from(
@@ -65,10 +69,14 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
 
 // Lee detalles del pedido para sacar email del comprador (payer.email_address)
 async function getOrderDetails(baseUrl, accessToken, orderId) {
-  const r = await fetch(`${baseUrl}/v2/checkout/orders/${encodeURIComponent(orderId)}`, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
+  const r = await fetch(
+    `${baseUrl}/v2/checkout/orders/${encodeURIComponent(orderId)}`,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }
+  );
+
   const text = await r.text();
   console.log("getOrderDetails:", r.status, text.slice(0, 200));
   if (!r.ok) throw new Error(`get order error: ${r.status}`);
@@ -85,39 +93,28 @@ function extractOrderIdFromEvent(event) {
 }
 
 function extractBuyerEmailDirect(event) {
-  // A veces viene directo en eventos de ORDER.*
+  // A veces viene directo en eventos ORDER.*
   return event?.resource?.payer?.email_address || null;
 }
 
-async function sendEmailResend({ to, bcc, orderId }) {
-  const payload = {
-    from: process.env.MAIL_FROM, // ej: Scoot Shop <support@scootshop.co>
-    to,
-    subject: `Pedido confirmado — en preparación (#${orderId})`,
-    text: `Hola,
-Hemos recibido tu pago correctamente. Tu pedido está confirmado y ya está en preparación.
+function extractAmountFromEvent(event) {
+  const v = event?.resource?.amount?.value || null;
+  const c = event?.resource?.amount?.currency_code || null;
+  return { value: v, currency: c };
+}
 
-Nº pedido: ${orderId}
+function pickProductMetaFromOrder(order) {
+  // Intenta extraer nombre y/o imagen si existieran (depende de cómo se generó el checkout)
+  const pu = order?.purchase_units?.[0] || null;
 
-Te avisaremos cuando salga enviado con su seguimiento.
-Support — Scoot Shop`,
-    reply_to: "support@scootshop.co",
-  };
+  const productName =
+    pu?.items?.[0]?.name ||
+    pu?.description ||
+    order?.purchase_units?.[0]?.soft_descriptor ||
+    null;
 
-  if (bcc) payload.bcc = [bcc];
-
-  const r = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const text = await r.text();
-  console.log("resend:", r.status, text.slice(0, 300));
-  if (!r.ok) throw new Error(`resend send error: ${r.status}`);
+  // PayPal Orders no suele traer imagen. La dejamos null y usamos default.
+  return { productName };
 }
 
 module.exports = async (req, res) => {
@@ -137,7 +134,9 @@ module.exports = async (req, res) => {
 
     const env = (process.env.PAYPAL_ENV || "live").toLowerCase();
     const baseUrl =
-      env === "sandbox" ? "https://api-m.sandbox.paypal.com" : "https://api-m.paypal.com";
+      env === "sandbox"
+        ? "https://api-m.sandbox.paypal.com"
+        : "https://api-m.paypal.com";
 
     const token = await paypalToken(baseUrl);
 
@@ -153,7 +152,7 @@ module.exports = async (req, res) => {
       );
     }
 
-    // Solo enviar email cuando el pago está completado
+    // ✅ Solo enviar email cuando el pago está completado
     const isPaid =
       event.event_type === "PAYMENT.CAPTURE.COMPLETED" ||
       event.event_type === "CHECKOUT.ORDER.COMPLETED";
@@ -161,19 +160,21 @@ module.exports = async (req, res) => {
     if (!isPaid) {
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: true, skipped: true, reason: "not a paid event" }));
+      return res.end(
+        JSON.stringify({ ok: true, skipped: true, reason: "not a paid event" })
+      );
     }
 
     // 1) Intento email directo
     let buyerEmail = extractBuyerEmailDirect(event);
 
     // 2) Si no viene, saco orderId y pido el order a PayPal (ahí sí viene payer.email_address)
-    if (!buyerEmail) {
-      const orderId = extractOrderIdFromEvent(event);
-      if (orderId) {
-        const order = await getOrderDetails(baseUrl, token, orderId);
-        buyerEmail = order?.payer?.email_address || null;
-      }
+    const orderId = extractOrderIdFromEvent(event);
+    let order = null;
+
+    if (!buyerEmail && orderId) {
+      order = await getOrderDetails(baseUrl, token, orderId);
+      buyerEmail = order?.payer?.email_address || null;
     }
 
     // Si sigue sin email, no rompas el webhook: devuelve 200 y loguea
@@ -181,23 +182,47 @@ module.exports = async (req, res) => {
       console.log("No buyer email found; no email sent.");
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: true, sent: false, reason: "missing buyer email" }));
+      return res.end(
+        JSON.stringify({ ok: true, sent: false, reason: "missing buyer email" })
+      );
     }
 
-    // ✅ TEST_EMAIL_TO ahora es BCC (copia para ti), NO reemplaza al comprador
-    const bcc = process.env.TEST_EMAIL_TO || "";
+    // ✅ BCC opcional (copia para ti), NO reemplaza al comprador
+    const bcc = (process.env.TEST_EMAIL_TO || "").trim();
 
-    // Identificador para el email (usa orderId si existe, sino id del evento)
+    // Identificador para el email (usa orderId si existe, sino id del capture/event)
     const orderIdForMail =
-      extractOrderIdFromEvent(event) ||
-      event?.resource?.id ||
-      event?.id ||
-      "—";
+      orderId || event?.resource?.id || event?.id || "—";
+
+    // Meta del producto (default configurable por ENV)
+    const defaults = {
+      productName: process.env.DEFAULT_PRODUCT_NAME || "Pedido Scoot Shop",
+      productImageUrl:
+        process.env.DEFAULT_PRODUCT_IMAGE_URL ||
+        "https://scootshop.co/patinetes/series-ix/ix3/img/1.jpg",
+      orderUrl: process.env.DEFAULT_ORDER_URL || "https://scootshop.co/",
+    };
+
+    const fromOrder = order ? pickProductMetaFromOrder(order) : {};
+    const amountFromEvent = extractAmountFromEvent(event);
 
     await sendEmailResend({
       to: buyerEmail,
       bcc: bcc || undefined,
       orderId: orderIdForMail,
+
+      // ✅ datos para email PRO (HTML)
+      productName: fromOrder.productName || defaults.productName,
+      amountValue:
+        order?.purchase_units?.[0]?.amount?.value ||
+        amountFromEvent.value ||
+        undefined,
+      currencyCode:
+        order?.purchase_units?.[0]?.amount?.currency_code ||
+        amountFromEvent.currency ||
+        undefined,
+      productImageUrl: defaults.productImageUrl,
+      orderUrl: defaults.orderUrl,
     });
 
     res.statusCode = 200;
