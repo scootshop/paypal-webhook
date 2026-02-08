@@ -27,6 +27,48 @@ const PRODUCT_CATALOG = Object.freeze({
   // TF3: { ... },
   // T10: { ... },
 });
+const PRODUCT_CATALOG = Object.freeze({
+  N7PRO: {
+    name: "N7PRO — Patinete eléctrico urbano",
+    imageUrl: "https://scootshop.co/patinetes/series-n/n7/img/1.jpg",
+    url: "https://scootshop.co/patinetes/series-n/n7/",
+  },
+  S4: {
+    name: "ZWheel MASCOOTER S4 — Homologado por la DGT",
+    imageUrl: "https://scootshop.co/patinetes/series-n/s4/img/1.jpg",
+    url: "https://scootshop.co/patinetes/series-n/s4/",
+  },
+  G2: {
+    name: "G2 — Patinete eléctrico de alta potencia",
+    imageUrl: "https://scootshop.co/patinetes/series-gt/g2/img/1.jpg",
+    url: "https://scootshop.co/patinetes/series-gt/g2/",
+  },
+  T10: {
+    name: "T10 — Patinete eléctrico Ultra",
+    imageUrl: "https://scootshop.co/patinetes/series-gt/t10/img/1.jpg",
+    url: "https://scootshop.co/patinetes/series-gt/t10/",
+  },
+  TF3: {
+    name: "TF3 — Patinete eléctrico Top",
+    imageUrl: "https://scootshop.co/patinetes/series-gt/tf3/img/1.jpg",
+    url: "https://scootshop.co/patinetes/series-gt/tf3/",
+  },
+  T30: {
+    name: "T30 — Patinete eléctrico Essential",
+    imageUrl: "https://scootshop.co/patinetes/series-gt/t30/img/1.jpg",
+    url: "https://scootshop.co/patinetes/series-gt/t30/",
+  },
+  IX3: {
+    name: "IX3 — Patinete eléctrico Serie IX",
+    imageUrl: "https://scootshop.co/patinetes/series-ix/ix3/img/1.jpg",
+    url: "https://scootshop.co/patinetes/series-ix/ix3/",
+  },
+  W9: {
+    name: "W9 — Patinete eléctrico Serie IX",
+    imageUrl: "https://scootshop.co/patinetes/series-ix/w9/img/1.jpg",
+    url: "https://scootshop.co/patinetes/series-ix/w9/",
+  },
+});
 
 // Defaults si no se puede identificar producto
 const DEFAULTS = Object.freeze({
