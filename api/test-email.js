@@ -3,13 +3,26 @@ const { sendEmailResend } = require("../lib/email");
 
 module.exports = async (req, res) => {
   try {
+    // Solo GET (o POST si quieres). Mantengo GET para probar desde el navegador.
+    if (req.method !== "GET") {
+      res.statusCode = 405;
+      res.setHeader("Allow", "GET");
+      return res.end("Method Not Allowed");
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+
+    // Seguridad por token
     const token = (req.query && req.query.token) || "";
     if (!process.env.TEST_EMAIL_TOKEN || token !== process.env.TEST_EMAIL_TOKEN) {
       res.statusCode = 401;
       return res.end("Unauthorized");
     }
 
-    const to = "jeanpierrepolo123456789@gmail.com";
+    // Permite opcionalmente pasar ?to=... si quieres probar otros correos
+    const to =
+      (req.query && req.query.to) ||
+      "jeanpierrepolo123456789@gmail.com";
 
     await sendEmailResend({
       to,
@@ -19,7 +32,7 @@ module.exports = async (req, res) => {
       currencyCode: "EUR",
       productImageUrl: "https://scootshop.co/patinetes/series-ix/ix3/img/1.jpg",
       orderUrl: "https://scootshop.co/patinetes/series-ix/ix3/",
-      bcc: process.env.TEST_EMAIL_TO || undefined,
+      bcc: (process.env.TEST_EMAIL_TO || "").trim() || undefined,
     });
 
     res.statusCode = 200;
