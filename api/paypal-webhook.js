@@ -1,9 +1,15 @@
 // api/paypal-webhook.js
 // Webhook PayPal (verifica firma) → obtiene email comprador → resuelve producto → envía email PRO con Resend
+// Compatible con:
+// - PAYMENT.CAPTURE.COMPLETED
+// - CHECKOUT.ORDER.COMPLETED
 // Requiere: /lib/email.js exportando sendEmailResend(...)
 
 const { sendEmailResend } = require("../lib/email");
 
+// --------------------
+// Helpers
+// --------------------
 function h(req, name) {
   return req.headers[name.toLowerCase()];
 }
@@ -17,8 +23,13 @@ async function readEvent(req) {
   return raw ? JSON.parse(raw) : null;
 }
 
+// --------------------
+// PayPal API helpers
+// --------------------
 async function paypalToken(baseUrl) {
-  const basic = Buffer.from(`${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_SECRET}`).toString("base64");
+  const basic = Buffer.from(
+    `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_SECRET}`
+  ).toString("base64");
 
   const r = await fetch(`${baseUrl}/v1/oauth2/token`, {
     method: "POST",
@@ -56,12 +67,11 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
   });
 
   const text = await r.text();
-  console.log("verify-webhook-signature:", r.status, text.slice(0, 500));
+  console.log("verify-webhook-signature:", r.status, text.slice(0, 300));
 
-  if (!r.ok) return { ok: false, status: r.status, body: text };
-
+  if (!r.ok) return { ok: false };
   const data = JSON.parse(text);
-  return { ok: data.verification_status === "SUCCESS", data };
+  return { ok: data.verification_status === "SUCCESS" };
 }
 
 async function getOrderDetails(baseUrl, accessToken, orderId) {
@@ -69,13 +79,23 @@ async function getOrderDetails(baseUrl, accessToken, orderId) {
     method: "GET",
     headers: { Authorization: `Bearer ${accessToken}` },
   });
+
   const text = await r.text();
   console.log("getOrderDetails:", r.status, text.slice(0, 200));
   if (!r.ok) throw new Error(`get order error: ${r.status}`);
   return JSON.parse(text);
 }
 
+// --------------------
+// Extractors (FIXED)
+// --------------------
 function extractOrderIdFromEvent(event) {
+  // CHECKOUT.ORDER.COMPLETED
+  if (event?.resource?.id && String(event.resource.id).startsWith("5")) {
+    return event.resource.id;
+  }
+
+  // PAYMENT.CAPTURE.COMPLETED
   return (
     event?.resource?.supplementary_data?.related_ids?.order_id ||
     event?.resource?.supplementary_data?.related_ids?.checkout_order_id ||
@@ -88,9 +108,10 @@ function extractBuyerEmailDirect(event) {
 }
 
 function extractAmountFromEvent(event) {
-  const v = event?.resource?.amount?.value || null;
-  const c = event?.resource?.amount?.currency_code || null;
-  return { value: v, currency: c };
+  return {
+    value: event?.resource?.amount?.value || null,
+    currency: event?.resource?.amount?.currency_code || null,
+  };
 }
 
 function normKey(s) {
@@ -98,137 +119,88 @@ function normKey(s) {
 }
 
 function absUrl(pathOrUrl) {
-  const u = String(pathOrUrl || "").trim();
-  if (!u) return "";
-  if (u.startsWith("http://") || u.startsWith("https://")) return u;
-  if (u.startsWith("/")) return "https://scootshop.co" + u;
-  return "https://scootshop.co/" + u;
+  if (!pathOrUrl) return "";
+  if (pathOrUrl.startsWith("http")) return pathOrUrl;
+  return "https://scootshop.co" + (pathOrUrl.startsWith("/") ? pathOrUrl : "/" + pathOrUrl);
 }
 
-// ======================================================
-// ✅ Catálogo (producto → URL + imagen + nombre)
-// Incluye claves por "código producto" y por "data-paypal" (hosted id)
-// ======================================================
+// --------------------
+// Product catalog
+// --------------------
 const PRODUCT_CATALOG = Object.freeze({
-  // Series N
   N7PRO: {
     productName: "N7PRO",
-    orderUrl: "https://scootshop.co/patinetes/series-n/n7/",
-    productImageUrl: "https://scootshop.co/patinetes/series-n/n7/img/1.jpg",
+    orderUrl: "/patinetes/series-n/n7/",
+    productImageUrl: "/patinetes/series-n/n7/img/1.jpg",
   },
-  PSFEEEULL7H5Y: {
-    productName: "N7PRO",
-    orderUrl: "https://scootshop.co/patinetes/series-n/n7/",
-    productImageUrl: "https://scootshop.co/patinetes/series-n/n7/img/1.jpg",
-  },
-
   S4: {
     productName: "ZWheel MASCOOTER S4",
-    orderUrl: "https://scootshop.co/patinetes/series-n/s4/",
-    productImageUrl: "https://scootshop.co/patinetes/series-n/s4/img/1.jpg",
+    orderUrl: "/patinetes/series-n/s4/",
+    productImageUrl: "/patinetes/series-n/s4/img/1.jpg",
   },
-  "3HAMJE5SBQPTG": {
-    productName: "ZWheel MASCOOTER S4",
-    orderUrl: "https://scootshop.co/patinetes/series-n/s4/",
-    productImageUrl: "https://scootshop.co/patinetes/series-n/s4/img/1.jpg",
-  },
-
-  // Series GT
   G2: {
     productName: "G2",
-    orderUrl: "https://scootshop.co/patinetes/series-gt/g2/",
-    productImageUrl: "https://scootshop.co/patinetes/series-gt/g2/img/1.jpg",
+    orderUrl: "/patinetes/series-gt/g2/",
+    productImageUrl: "/patinetes/series-gt/g2/img/1.jpg",
   },
-  "7AFW42AS3FC8Q": {
-    productName: "G2",
-    orderUrl: "https://scootshop.co/patinetes/series-gt/g2/",
-    productImageUrl: "https://scootshop.co/patinetes/series-gt/g2/img/1.jpg",
-  },
-
   T10: {
     productName: "T10",
-    orderUrl: "https://scootshop.co/patinetes/series-gt/t10/",
-    productImageUrl: "https://scootshop.co/patinetes/series-gt/t10/img/1.jpg",
+    orderUrl: "/patinetes/series-gt/t10/",
+    productImageUrl: "/patinetes/series-gt/t10/img/1.jpg",
   },
-  WE5GUHM4PSVYQ: {
-    productName: "T10",
-    orderUrl: "https://scootshop.co/patinetes/series-gt/t10/",
-    productImageUrl: "https://scootshop.co/patinetes/series-gt/t10/img/1.jpg",
-  },
-
   TF3: {
     productName: "TF3",
-    orderUrl: "https://scootshop.co/patinetes/series-gt/tf3/",
-    productImageUrl: "https://scootshop.co/patinetes/series-gt/tf3/img/1.jpg",
+    orderUrl: "/patinetes/series-gt/tf3/",
+    productImageUrl: "/patinetes/series-gt/tf3/img/1.jpg",
   },
-  JAEYYZG6XE7HQ: {
-    productName: "TF3",
-    orderUrl: "https://scootshop.co/patinetes/series-gt/tf3/",
-    productImageUrl: "https://scootshop.co/patinetes/series-gt/tf3/img/1.jpg",
-  },
-
   T30: {
     productName: "T30",
-    orderUrl: "https://scootshop.co/patinetes/series-gt/t30/",
-    productImageUrl: "https://scootshop.co/patinetes/series-gt/t30/img/1.jpg",
+    orderUrl: "/patinetes/series-gt/t30/",
+    productImageUrl: "/patinetes/series-gt/t30/img/1.jpg",
   },
-  J3VG9GQ3QU6A6: {
-    productName: "T30",
-    orderUrl: "https://scootshop.co/patinetes/series-gt/t30/",
-    productImageUrl: "https://scootshop.co/patinetes/series-gt/t30/img/1.jpg",
-  },
-
-  // Serie IX
   IX3: {
     productName: "IX3",
-    orderUrl: "https://scootshop.co/patinetes/series-ix/ix3/",
-    productImageUrl: "https://scootshop.co/patinetes/series-ix/ix3/img/1.jpg",
+    orderUrl: "/patinetes/series-ix/ix3/",
+    productImageUrl: "/patinetes/series-ix/ix3/img/1.jpg",
   },
-  "7ML59E5E7UA66": {
-    productName: "IX3",
-    orderUrl: "https://scootshop.co/patinetes/series-ix/ix3/",
-    productImageUrl: "https://scootshop.co/patinetes/series-ix/ix3/img/1.jpg",
-  },
-
   W9: {
     productName: "W9",
-    orderUrl: "https://scootshop.co/patinetes/series-ix/w9/",
-    productImageUrl: "https://scootshop.co/patinetes/series-ix/w9/img/1.jpg",
-  },
-  "3JT9QGYWBE496": {
-    productName: "W9",
-    orderUrl: "https://scootshop.co/patinetes/series-ix/w9/",
-    productImageUrl: "https://scootshop.co/patinetes/series-ix/w9/img/1.jpg",
+    orderUrl: "/patinetes/series-ix/w9/",
+    productImageUrl: "/patinetes/series-ix/w9/img/1.jpg",
   },
 });
 
-const PRODUCT_CODES = ["N7PRO", "S4", "G2", "T10", "TF3", "T30", "IX3", "W9"];
+const PRODUCT_CODES = Object.keys(PRODUCT_CATALOG);
 
+// --------------------
+// Product resolver
+// --------------------
 function resolveProductFromOrder(order) {
-  const pu = order?.purchase_units?.[0] || null;
-  const item0 = pu?.items?.[0] || null;
+  const pu = order?.purchase_units?.[0];
+  if (!pu) return null;
+
+  const item0 = pu.items?.[0];
 
   const candidates = [
-    pu?.custom_id,
-    pu?.invoice_id,
-    pu?.reference_id,
+    pu.custom_id,
+    pu.reference_id,
+    pu.invoice_id,
     item0?.sku,
     item0?.name,
-    pu?.description,
-    order?.purchase_units?.[0]?.soft_descriptor,
+    pu.description,
   ]
     .filter(Boolean)
     .map(normKey);
 
-  // 1) match exact (incluye IDs data-paypal)
   for (const c of candidates) {
-    if (PRODUCT_CATALOG[c]) return { ...PRODUCT_CATALOG[c], matchedBy: c };
+    if (PRODUCT_CATALOG[c]) {
+      return { ...PRODUCT_CATALOG[c], matchedBy: c };
+    }
   }
 
-  // 2) match por contener código producto (TF3, T10, etc.)
   for (const c of candidates) {
     for (const code of PRODUCT_CODES) {
-      if (c.includes(code) && PRODUCT_CATALOG[code]) {
+      if (c.includes(code)) {
         return { ...PRODUCT_CATALOG[code], matchedBy: c };
       }
     }
@@ -237,6 +209,9 @@ function resolveProductFromOrder(order) {
   return null;
 }
 
+// --------------------
+// Main handler
+// --------------------
 module.exports = async (req, res) => {
   try {
     if (req.method !== "POST") {
@@ -253,90 +228,70 @@ module.exports = async (req, res) => {
     console.log("event_type:", event.event_type);
 
     const env = (process.env.PAYPAL_ENV || "live").toLowerCase();
-    const baseUrl = env === "sandbox" ? "https://api-m.sandbox.paypal.com" : "https://api-m.paypal.com";
+    const baseUrl =
+      env === "sandbox"
+        ? "https://api-m.sandbox.paypal.com"
+        : "https://api-m.paypal.com";
 
     const token = await paypalToken(baseUrl);
 
     const verify = await verifyWebhook(baseUrl, token, req, event);
     if (!verify.ok) {
       res.statusCode = 400;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, reason: "Invalid signature" }));
+      return res.end("Invalid signature");
     }
 
-    // Solo enviar cuando el pago está completado
     const isPaid =
       event.event_type === "PAYMENT.CAPTURE.COMPLETED" ||
       event.event_type === "CHECKOUT.ORDER.COMPLETED";
 
     if (!isPaid) {
       res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: true, skipped: true, reason: "not a paid event" }));
+      return res.end("Ignored");
     }
-
-    let buyerEmail = extractBuyerEmailDirect(event);
 
     const orderId = extractOrderIdFromEvent(event);
-    let order = null;
-
-    if ((!buyerEmail || !order) && orderId) {
-      order = await getOrderDetails(baseUrl, token, orderId);
-      buyerEmail = buyerEmail || order?.payer?.email_address || null;
+    if (!orderId) {
+      console.log("No orderId found");
+      res.statusCode = 200;
+      return res.end("No orderId");
     }
+
+    const order = await getOrderDetails(baseUrl, token, orderId);
+    const buyerEmail =
+      extractBuyerEmailDirect(event) ||
+      order?.payer?.email_address ||
+      null;
 
     if (!buyerEmail) {
-      console.log("No buyer email found; no email sent.");
+      console.log("No buyer email");
       res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: true, sent: false, reason: "missing buyer email" }));
+      return res.end("No buyer email");
     }
 
-    const bcc = (process.env.TEST_EMAIL_TO || "").trim();
+    const resolved = resolveProductFromOrder(order);
+    console.log("resolved product:", resolved?.productName || "NONE");
 
-    const orderIdForMail = orderId || event?.resource?.id || event?.id || "—";
-
-    // defaults (fallback)
-    const defaults = {
-      productName: process.env.DEFAULT_PRODUCT_NAME || "Pedido Scoot Shop",
-      productImageUrl: absUrl(process.env.DEFAULT_PRODUCT_IMAGE_URL || "/patinetes/series-ix/ix3/img/1.jpg"),
-      orderUrl: absUrl(process.env.DEFAULT_ORDER_URL || "/"),
-    };
-
-    const amountFromEvent = extractAmountFromEvent(event);
-
-    // Resolver producto desde el Order (si es posible)
-    const resolved = order ? resolveProductFromOrder(order) : null;
-    if (resolved) console.log("resolved product:", resolved.productName, "matchedBy:", resolved.matchedBy);
-    else console.log("resolved product: NONE (using defaults)");
-
-    const amountValue =
-      order?.purchase_units?.[0]?.amount?.value ||
-      amountFromEvent.value ||
-      undefined;
-
-    const currencyCode =
-      order?.purchase_units?.[0]?.amount?.currency_code ||
-      amountFromEvent.currency ||
-      undefined;
+    const amountValue = order?.purchase_units?.[0]?.amount?.value;
+    const currencyCode = order?.purchase_units?.[0]?.amount?.currency_code;
 
     await sendEmailResend({
       to: buyerEmail,
-      bcc: bcc || undefined,
-      orderId: orderIdForMail,
-
-      productName: resolved?.productName || defaults.productName,
+      orderId,
+      productName: resolved?.productName || "Pedido Scoot Shop",
       amountValue,
       currencyCode,
-      productImageUrl: resolved?.productImageUrl || defaults.productImageUrl,
-      orderUrl: resolved?.orderUrl || defaults.orderUrl,
+      productImageUrl: absUrl(
+        resolved?.productImageUrl || "/patinetes/series-ix/ix3/img/1.jpg"
+      ),
+      orderUrl: absUrl(resolved?.orderUrl || "/"),
+      bcc: process.env.TEST_EMAIL_TO || undefined,
     });
 
     res.statusCode = 200;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: true, sentTo: buyerEmail, bcc: !!bcc }));
+    return res.end("OK");
   } catch (e) {
-    console.log("Server error:", e?.message || e);
+    console.error("Webhook error:", e);
     res.statusCode = 500;
     return res.end("Server error");
   }
