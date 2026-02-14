@@ -1,155 +1,88 @@
-// /api/paypal/create-order.js
-// Crea una orden PayPal usando PRECIO DEL SERVIDOR (no del cliente)
-
-function setCors(req, res) {
-  const origin = req.headers.origin || "";
-  const allowed = new Set([
-    "https://scootshop.co",
-    "https://www.scootshop.co",
-  ]);
-
-  if (allowed.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else {
-    // si quieres, deja fijo tu dominio en vez de reflejar
-    res.setHeader("Access-Control-Allow-Origin", "https://scootshop.co");
-  }
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-async function readJson(req) {
-  if (req.body) return typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-  const chunks = [];
-  for await (const c of req) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
-  const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? JSON.parse(raw) : {};
-}
-
-function paypalBase() {
-  const env = (process.env.PAYPAL_ENV || "live").toLowerCase();
-  return env === "sandbox" ? "https://api-m.sandbox.paypal.com" : "https://api-m.paypal.com";
-}
-
-async function paypalToken() {
-  const baseUrl = paypalBase();
-  const basic = Buffer.from(`${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_SECRET}`).toString("base64");
-
-  const r = await fetch(`${baseUrl}/v1/oauth2/token`, {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${basic}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: "grant_type=client_credentials",
-  });
-
-  const text = await r.text();
-  if (!r.ok) throw new Error(`paypal token error ${r.status}: ${text.slice(0, 200)}`);
-  return { access_token: JSON.parse(text).access_token, baseUrl };
-}
-
-// ✅ Catálogo SERVER-SIDE (la fuente de verdad)
-const PRODUCT_CATALOG = Object.freeze({
-  T10: { name: "T10", price: "450.00", currency: "EUR" },
-  TF3: { name: "TF3", price: "799.00", currency: "EUR" },
-  IX3: { name: "IX3", price: "399.00", currency: "EUR" },
-  G2:  { name: "G2",  price: "299.00", currency: "EUR" },
-  N7PRO:{ name: "N7PRO", price: "349.00", currency: "EUR" },
-  S4:  { name: "S4",  price: "279.00", currency: "EUR" },
-  T30: { name: "T30", price: "899.00", currency: "EUR" },
-  W9:  { name: "W9",  price: "499.00", currency: "EUR" },
-});
-
-function normSku(v) {
-  return String(v || "").trim().toUpperCase();
-}
-
 module.exports = async (req, res) => {
+  // CORS
+  const origin = req.headers.origin || "";
+  const allowOrigin = (process.env.ALLOWED_ORIGIN || "https://scootshop.co");
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
   try {
-    setCors(req, res);
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const name = String(body.name || "").trim() || "Producto SCOOT SHOP";
+    const sku = String(body.sku || "").trim();
+    const ref = String(body.ref || "").trim();
+    const currency = String(body.currency || "EUR").trim().toUpperCase();
 
-    if (req.method === "OPTIONS") {
-      res.statusCode = 204;
-      return res.end();
+    const priceNum = Number(String(body.price || "").replace(",", "."));
+    if (!Number.isFinite(priceNum) || priceNum <= 0) {
+      return res.status(400).json({ error: "Invalid price" });
+    }
+    const value = priceNum.toFixed(2);
+
+    const clientId = process.env.PAYPAL_CLIENT_ID;
+    const secret = process.env.PAYPAL_CLIENT_SECRET;
+    if (!clientId || !secret) {
+      return res.status(500).json({ error: "Missing PAYPAL env vars" });
     }
 
-    if (req.method !== "POST") {
-      res.statusCode = 405;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
-    }
+    const env = (process.env.PAYPAL_ENV || "live").toLowerCase();
+    const base = env === "sandbox" ? "https://api-m.sandbox.paypal.com" : "https://api-m.paypal.com";
 
-    const body = await readJson(req);
-    const sku = normSku(body.sku);
-
-    if (!sku || !PRODUCT_CATALOG[sku]) {
-      res.statusCode = 400;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, error: "SKU inválido" }));
-    }
-
-    const item = PRODUCT_CATALOG[sku];
-    const ref = String(body.ref || "").slice(0, 64) || `SS-${Date.now()}`;
-
-    const { access_token, baseUrl } = await paypalToken();
-
-    // Crear orden PayPal
-    const payload = {
-      intent: "CAPTURE",
-      purchase_units: [
-        {
-          reference_id: sku,                 // útil para tu resolveProductFromOrder
-          custom_id: ref,                    // tu referencia interna
-          description: `SCOOT SHOP · ${item.name}`,
-          amount: {
-            currency_code: item.currency,
-            value: item.price,
-          },
-          items: [
-            {
-              name: item.name,
-              sku: sku,
-              quantity: "1",
-              unit_amount: {
-                currency_code: item.currency,
-                value: item.price,
-              },
-            },
-          ],
-        },
-      ],
-      application_context: {
-        brand_name: "SCOOT SHOP",
-        user_action: "PAY_NOW",
-        shipping_preference: "NO_SHIPPING",
-      },
-    };
-
-    const r = await fetch(`${baseUrl}/v2/checkout/orders`, {
+    // 1) Access token
+    const tokenRes = await fetch(`${base}/v1/oauth2/token`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${access_token}`,
-        "Content-Type": "application/json",
+        "Authorization": "Basic " + Buffer.from(`${clientId}:${secret}`).toString("base64"),
+        "Content-Type": "application/x-www-form-urlencoded",
       },
-      body: JSON.stringify(payload),
+      body: "grant_type=client_credentials",
     });
 
-    const text = await r.text();
-    if (!r.ok) {
-      res.statusCode = 500;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, error: "create order failed", detail: text.slice(0, 500) }));
+    const tokenText = await tokenRes.text();
+    let tokenJson = {};
+    try { tokenJson = tokenText ? JSON.parse(tokenText) : {}; } catch {}
+    if (!tokenRes.ok || !tokenJson.access_token) {
+      console.error("PAYPAL TOKEN ERROR", tokenRes.status, tokenText);
+      return res.status(500).json({ error: "PayPal token error", detail: tokenJson });
     }
 
-    const data = JSON.parse(text);
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: true, id: data.id }));
+    // 2) Create order
+    const orderPayload = {
+      intent: "CAPTURE",
+      purchase_units: [{
+        reference_id: ref || undefined,
+        description: name,
+        custom_id: sku || undefined,
+        amount: { currency_code: currency, value },
+      }]
+    };
+
+    const orderRes = await fetch(`${base}/v2/checkout/orders`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${tokenJson.access_token}`,
+      },
+      body: JSON.stringify(orderPayload),
+    });
+
+    const orderText = await orderRes.text();
+    let orderJson = {};
+    try { orderJson = orderText ? JSON.parse(orderText) : {}; } catch {}
+
+    if (!orderRes.ok || !orderJson.id) {
+      console.error("PAYPAL CREATE ORDER ERROR", orderRes.status, orderText);
+      return res.status(500).json({ error: "PayPal create order error", detail: orderJson });
+    }
+
+    return res.status(200).json({ id: orderJson.id });
+
   } catch (e) {
-    res.statusCode = 500;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: false, error: "Server error", detail: String(e?.message || e) }));
+    console.error("CREATE-ORDER UNHANDLED", e);
+    return res.status(500).json({ error: "Internal error", detail: String(e && e.message ? e.message : e) });
   }
 };
