@@ -1,103 +1,68 @@
-// /api/paypal/capture-order.js
-// Captura una orden PayPal (server-side)
-
-function setCors(req, res) {
-  const origin = req.headers.origin || "";
-  const allowed = new Set([
-    "https://scootshop.co",
-    "https://www.scootshop.co",
-  ]);
-
-  if (allowed.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else {
-    res.setHeader("Access-Control-Allow-Origin", "https://scootshop.co");
-  }
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-async function readJson(req) {
-  if (req.body) return typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-  const chunks = [];
-  for await (const c of req) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
-  const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? JSON.parse(raw) : {};
-}
-
-function paypalBase() {
-  const env = (process.env.PAYPAL_ENV || "live").toLowerCase();
-  return env === "sandbox" ? "https://api-m.sandbox.paypal.com" : "https://api-m.paypal.com";
-}
-
-async function paypalToken() {
-  const baseUrl = paypalBase();
-  const basic = Buffer.from(`${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_SECRET}`).toString("base64");
-
-  const r = await fetch(`${baseUrl}/v1/oauth2/token`, {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${basic}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: "grant_type=client_credentials",
-  });
-
-  const text = await r.text();
-  if (!r.ok) throw new Error(`paypal token error ${r.status}: ${text.slice(0, 200)}`);
-  return { access_token: JSON.parse(text).access_token, baseUrl };
-}
-
 module.exports = async (req, res) => {
+  // CORS
+  const allowOrigin = (process.env.ALLOWED_ORIGIN || "https://scootshop.co");
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
   try {
-    setCors(req, res);
-
-    if (req.method === "OPTIONS") {
-      res.statusCode = 204;
-      return res.end();
-    }
-
-    if (req.method !== "POST") {
-      res.statusCode = 405;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
-    }
-
-    const body = await readJson(req);
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
     const orderID = String(body.orderID || "").trim();
+    if (!orderID) return res.status(400).json({ error: "Missing orderID" });
 
-    if (!orderID) {
-      res.statusCode = 400;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, error: "orderID requerido" }));
+    const clientId = process.env.PAYPAL_CLIENT_ID;
+    const secret = process.env.PAYPAL_CLIENT_SECRET;
+    if (!clientId || !secret) {
+      return res.status(500).json({ error: "Missing PAYPAL env vars" });
     }
 
-    const { access_token, baseUrl } = await paypalToken();
+    const env = (process.env.PAYPAL_ENV || "live").toLowerCase();
+    const base = env === "sandbox" ? "https://api-m.sandbox.paypal.com" : "https://api-m.paypal.com";
 
-    const r = await fetch(`${baseUrl}/v2/checkout/orders/${encodeURIComponent(orderID)}/capture`, {
+    // token
+    const tokenRes = await fetch(`${base}/v1/oauth2/token`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${access_token}`,
-        "Content-Type": "application/json",
+        "Authorization": "Basic " + Buffer.from(`${clientId}:${secret}`).toString("base64"),
+        "Content-Type": "application/x-www-form-urlencoded",
       },
-      body: JSON.stringify({}),
+      body: "grant_type=client_credentials",
     });
 
-    const text = await r.text();
-    if (!r.ok) {
-      res.statusCode = 500;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(JSON.stringify({ ok: false, error: "capture failed", detail: text.slice(0, 500) }));
+    const tokenText = await tokenRes.text();
+    let tokenJson = {};
+    try { tokenJson = tokenText ? JSON.parse(tokenText) : {}; } catch {}
+    if (!tokenRes.ok || !tokenJson.access_token) {
+      console.error("PAYPAL TOKEN ERROR", tokenRes.status, tokenText);
+      return res.status(500).json({ error: "PayPal token error", detail: tokenJson });
     }
 
-    const data = JSON.parse(text);
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: true, status: data.status, id: data.id }));
+    // capture
+    const capRes = await fetch(`${base}/v2/checkout/orders/${encodeURIComponent(orderID)}/capture`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${tokenJson.access_token}`,
+      },
+    });
+
+    const capText = await capRes.text();
+    let capJson = {};
+    try { capJson = capText ? JSON.parse(capText) : {}; } catch {}
+
+    if (!capRes.ok) {
+      console.error("PAYPAL CAPTURE ERROR", capRes.status, capText);
+      return res.status(500).json({ error: "PayPal capture error", detail: capJson });
+    }
+
+    return res.status(200).json({ status: capJson.status, id: capJson.id, result: capJson });
+
   } catch (e) {
-    res.statusCode = 500;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ ok: false, error: "Server error", detail: String(e?.message || e) }));
+    console.error("CAPTURE UNHANDLED", e);
+    return res.status(500).json({ error: "Internal error", detail: String(e && e.message ? e.message : e) });
   }
 };
