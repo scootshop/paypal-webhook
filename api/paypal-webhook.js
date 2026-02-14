@@ -11,25 +11,58 @@ const { sendEmailResend } = require("../lib/email");
 // Helpers
 // --------------------
 function h(req, name) {
-  return req.headers[name.toLowerCase()];
+  // Node/Vercel normaliza headers a minúsculas, pero por seguridad intentamos ambos
+  const k = String(name || "").toLowerCase();
+  return req.headers?.[k] || req.headers?.[name] || null;
 }
 
 async function readEvent(req) {
-  if (req.body) return typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+  try {
+    if (req.body) {
+      return typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    }
 
-  const chunks = [];
-  for await (const c of req) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
-  const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? JSON.parse(raw) : null;
+    const chunks = [];
+    for await (const c of req) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
+    const raw = Buffer.concat(chunks).toString("utf8");
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    console.error("readEvent parse error:", e);
+    return null;
+  }
+}
+
+function jsonOrNull(text) {
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
 }
 
 // --------------------
 // PayPal API helpers
 // --------------------
+function paypalBaseUrl() {
+  const env = (process.env.PAYPAL_ENV || "live").toLowerCase();
+  return env === "sandbox" ? "https://api-m.sandbox.paypal.com" : "https://api-m.paypal.com";
+}
+
+function getPaypalCreds() {
+  const clientId = process.env.PAYPAL_CLIENT_ID;
+  // Compat: algunos proyectos usan PAYPAL_SECRET, otros PAYPAL_CLIENT_SECRET
+  const secret = process.env.PAYPAL_SECRET || process.env.PAYPAL_CLIENT_SECRET;
+
+  return { clientId, secret };
+}
+
 async function paypalToken(baseUrl) {
-  const basic = Buffer.from(
-    `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_SECRET}`
-  ).toString("base64");
+  const { clientId, secret } = getPaypalCreds();
+  if (!clientId || !secret) {
+    throw new Error("Missing PAYPAL_CLIENT_ID / PAYPAL_SECRET (or PAYPAL_CLIENT_SECRET) env vars");
+  }
+
+  const basic = Buffer.from(`${clientId}:${secret}`).toString("base64");
 
   const r = await fetch(`${baseUrl}/v1/oauth2/token`, {
     method: "POST",
@@ -41,21 +74,43 @@ async function paypalToken(baseUrl) {
   });
 
   const text = await r.text();
+  const data = jsonOrNull(text);
+
   console.log("paypalToken:", r.status, text.slice(0, 200));
-  if (!r.ok) throw new Error(`paypal token error: ${r.status}`);
-  return JSON.parse(text).access_token;
+
+  if (!r.ok || !data?.access_token) {
+    console.error("paypalToken error body:", text.slice(0, 2000));
+    throw new Error(`paypal token error: ${r.status}`);
+  }
+
+  return data.access_token;
 }
 
 async function verifyWebhook(baseUrl, accessToken, req, event) {
+  const webhookId = process.env.PAYPAL_WEBHOOK_ID;
+  if (!webhookId) {
+    console.error("Missing PAYPAL_WEBHOOK_ID env var");
+    return { ok: false, reason: "missing_webhook_id" };
+  }
+
   const payload = {
     auth_algo: h(req, "paypal-auth-algo"),
     cert_url: h(req, "paypal-cert-url"),
     transmission_id: h(req, "paypal-transmission-id"),
     transmission_sig: h(req, "paypal-transmission-sig"),
     transmission_time: h(req, "paypal-transmission-time"),
-    webhook_id: process.env.PAYPAL_WEBHOOK_ID,
+    webhook_id: webhookId,
     webhook_event: event,
   };
+
+  // Si faltan headers críticos, no tiene sentido llamar a PayPal
+  const required = ["auth_algo", "cert_url", "transmission_id", "transmission_sig", "transmission_time"];
+  for (const k of required) {
+    if (!payload[k]) {
+      console.error("Missing PayPal header for verification:", k);
+      return { ok: false, reason: "missing_headers" };
+    }
+  }
 
   const r = await fetch(`${baseUrl}/v1/notifications/verify-webhook-signature`, {
     method: "POST",
@@ -69,9 +124,13 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
   const text = await r.text();
   console.log("verify-webhook-signature:", r.status, text.slice(0, 300));
 
-  if (!r.ok) return { ok: false };
-  const data = JSON.parse(text);
-  return { ok: data.verification_status === "SUCCESS" };
+  if (!r.ok) {
+    console.error("verify-webhook-signature error body:", text.slice(0, 2000));
+    return { ok: false, reason: `paypal_${r.status}` };
+  }
+
+  const data = jsonOrNull(text);
+  return { ok: data?.verification_status === "SUCCESS" };
 }
 
 async function getOrderDetails(baseUrl, accessToken, orderId) {
@@ -82,20 +141,29 @@ async function getOrderDetails(baseUrl, accessToken, orderId) {
 
   const text = await r.text();
   console.log("getOrderDetails:", r.status, text.slice(0, 200));
-  if (!r.ok) throw new Error(`get order error: ${r.status}`);
-  return JSON.parse(text);
+
+  if (!r.ok) {
+    console.error("getOrderDetails error body:", text.slice(0, 2000));
+    throw new Error(`get order error: ${r.status}`);
+  }
+
+  const data = jsonOrNull(text);
+  if (!data) throw new Error("get order error: invalid json");
+  return data;
 }
 
 // --------------------
-// Extractors (FIXED)
+// Extractors
 // --------------------
 function extractOrderIdFromEvent(event) {
-  // CHECKOUT.ORDER.COMPLETED
-  if (event?.resource?.id && String(event.resource.id).startsWith("5")) {
-    return event.resource.id;
+  const type = String(event?.event_type || "");
+
+  // En CHECKOUT.ORDER.* el resource.id es el ID de la orden
+  if (type.startsWith("CHECKOUT.ORDER.") && event?.resource?.id) {
+    return String(event.resource.id);
   }
 
-  // PAYMENT.CAPTURE.COMPLETED
+  // En PAYMENT.CAPTURE.* el resource.id suele ser el CAPTURE id, no el order id
   return (
     event?.resource?.supplementary_data?.related_ids?.order_id ||
     event?.resource?.supplementary_data?.related_ids?.checkout_order_id ||
@@ -105,13 +173,6 @@ function extractOrderIdFromEvent(event) {
 
 function extractBuyerEmailDirect(event) {
   return event?.resource?.payer?.email_address || null;
-}
-
-function extractAmountFromEvent(event) {
-  return {
-    value: event?.resource?.amount?.value || null,
-    currency: event?.resource?.amount?.currency_code || null,
-  };
 }
 
 function normKey(s) {
@@ -193,16 +254,12 @@ function resolveProductFromOrder(order) {
     .map(normKey);
 
   for (const c of candidates) {
-    if (PRODUCT_CATALOG[c]) {
-      return { ...PRODUCT_CATALOG[c], matchedBy: c };
-    }
+    if (PRODUCT_CATALOG[c]) return { ...PRODUCT_CATALOG[c], matchedBy: c };
   }
 
   for (const c of candidates) {
     for (const code of PRODUCT_CODES) {
-      if (c.includes(code)) {
-        return { ...PRODUCT_CATALOG[code], matchedBy: c };
-      }
+      if (c.includes(code)) return { ...PRODUCT_CATALOG[code], matchedBy: c };
     }
   }
 
@@ -222,17 +279,13 @@ module.exports = async (req, res) => {
     const event = await readEvent(req);
     if (!event) {
       res.statusCode = 400;
-      return res.end("Missing body");
+      return res.end("Invalid/Missing JSON body");
     }
 
-    console.log("event_type:", event.event_type);
+    const eventType = String(event.event_type || "");
+    console.log("event_type:", eventType);
 
-    const env = (process.env.PAYPAL_ENV || "live").toLowerCase();
-    const baseUrl =
-      env === "sandbox"
-        ? "https://api-m.sandbox.paypal.com"
-        : "https://api-m.paypal.com";
-
+    const baseUrl = paypalBaseUrl();
     const token = await paypalToken(baseUrl);
 
     const verify = await verifyWebhook(baseUrl, token, req, event);
@@ -242,8 +295,8 @@ module.exports = async (req, res) => {
     }
 
     const isPaid =
-      event.event_type === "PAYMENT.CAPTURE.COMPLETED" ||
-      event.event_type === "CHECKOUT.ORDER.COMPLETED";
+      eventType === "PAYMENT.CAPTURE.COMPLETED" ||
+      eventType === "CHECKOUT.ORDER.COMPLETED";
 
     if (!isPaid) {
       res.statusCode = 200;
@@ -258,6 +311,7 @@ module.exports = async (req, res) => {
     }
 
     const order = await getOrderDetails(baseUrl, token, orderId);
+
     const buyerEmail =
       extractBuyerEmailDirect(event) ||
       order?.payer?.email_address ||
@@ -281,9 +335,7 @@ module.exports = async (req, res) => {
       productName: resolved?.productName || "Pedido Scoot Shop",
       amountValue,
       currencyCode,
-      productImageUrl: absUrl(
-        resolved?.productImageUrl || "/patinetes/series-ix/ix3/img/1.jpg"
-      ),
+      productImageUrl: absUrl(resolved?.productImageUrl || "/patinetes/series-ix/ix3/img/1.jpg"),
       orderUrl: absUrl(resolved?.orderUrl || "/"),
       bcc: process.env.TEST_EMAIL_TO || undefined,
     });
