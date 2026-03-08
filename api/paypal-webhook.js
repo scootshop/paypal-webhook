@@ -183,6 +183,21 @@ function compactKey(s) {
   return normKey(s).replace(/[^A-Z0-9]/g, "");
 }
 
+function normalizePath(pathOrUrl) {
+  const value = String(pathOrUrl || "").trim();
+  if (!value) return "";
+
+  if (/^https?:\/\//i.test(value)) {
+    try {
+      return new URL(value).pathname || "";
+    } catch {
+      return value;
+    }
+  }
+
+  return value.startsWith("/") ? value : "/" + value;
+}
+
 function absUrl(pathOrUrl) {
   if (!pathOrUrl) return "";
   if (pathOrUrl.startsWith("http")) return pathOrUrl;
@@ -190,9 +205,15 @@ function absUrl(pathOrUrl) {
 }
 
 // --------------------
-// Product catalog
+// Product resolution
 // --------------------
-const PRODUCT_CATALOG = Object.freeze({
+const PUBLIC_CATALOG_URL = process.env.PUBLIC_CATALOG_URL || "https://scootshop.co/data/products.js";
+const PUBLIC_CATALOG_TTL_MS = 5 * 60 * 1000;
+
+let publicCatalogCachePromise = null;
+let publicCatalogCacheExpiresAt = 0;
+
+const LEGACY_PRODUCT_CATALOG = Object.freeze({
   N7PRO: {
     productName: "N7PRO",
     orderUrl: "/patinetes/series-n/n7/",
@@ -260,7 +281,7 @@ const PRODUCT_CATALOG = Object.freeze({
   },
 });
 
-const PRODUCT_ALIASES = Object.freeze({
+const LEGACY_PRODUCT_ALIASES = Object.freeze({
   N7: "N7PRO",
   N7PRO: "N7PRO",
 
@@ -294,28 +315,28 @@ const PRODUCT_ALIASES = Object.freeze({
   W9: "W9",
 });
 
-const PRODUCT_ALIASES_COMPACT = Object.freeze(
+const LEGACY_PRODUCT_ALIASES_COMPACT = Object.freeze(
   Object.fromEntries(
-    Object.entries(PRODUCT_ALIASES).map(([key, code]) => [compactKey(key), code])
+    Object.entries(LEGACY_PRODUCT_ALIASES).map(([key, code]) => [compactKey(key), code])
   )
 );
 
-const PRODUCT_CODES = Object.keys(PRODUCT_CATALOG).sort(
+const LEGACY_PRODUCT_CODES = Object.keys(LEGACY_PRODUCT_CATALOG).sort(
   (a, b) => compactKey(b).length - compactKey(a).length
 );
 
-function resolveProductCode(raw) {
+function resolveLegacyProductCode(raw) {
   const exact = normKey(raw);
   if (!exact) return null;
 
-  if (PRODUCT_CATALOG[exact]) return exact;
-  if (PRODUCT_ALIASES[exact]) return PRODUCT_ALIASES[exact];
+  if (LEGACY_PRODUCT_CATALOG[exact]) return exact;
+  if (LEGACY_PRODUCT_ALIASES[exact]) return LEGACY_PRODUCT_ALIASES[exact];
 
   const compact = compactKey(exact);
-  if (PRODUCT_CATALOG[compact]) return compact;
-  if (PRODUCT_ALIASES_COMPACT[compact]) return PRODUCT_ALIASES_COMPACT[compact];
+  if (LEGACY_PRODUCT_CATALOG[compact]) return compact;
+  if (LEGACY_PRODUCT_ALIASES_COMPACT[compact]) return LEGACY_PRODUCT_ALIASES_COMPACT[compact];
 
-  for (const code of PRODUCT_CODES) {
+  for (const code of LEGACY_PRODUCT_CODES) {
     if (compact.includes(compactKey(code))) {
       return code;
     }
@@ -324,16 +345,13 @@ function resolveProductCode(raw) {
   return null;
 }
 
-// --------------------
-// Product resolver
-// --------------------
-function resolveProductFromOrder(order) {
+function buildOrderCandidates(order) {
   const pu = order?.purchase_units?.[0];
-  if (!pu) return null;
+  if (!pu) return [];
 
   const item0 = pu.items?.[0];
 
-  const candidates = [
+  return [
     pu.custom_id,
     pu.reference_id,
     pu.invoice_id,
@@ -341,15 +359,138 @@ function resolveProductFromOrder(order) {
     item0?.name,
     pu.description,
   ].filter(Boolean);
+}
+
+function normalizeCatalogProduct(product) {
+  if (!product || typeof product !== "object") return null;
+
+  const sku = String(product.sku || product.id || "").trim();
+  const productName = String(product.name || sku || "Producto SCOOT SHOP").trim();
+  const orderUrl = normalizePath(product.href || "/");
+  const productImageUrl = String(product.image || "/patinetes/series-ix/ix3/img/1.jpg").trim();
+
+  return {
+    sku,
+    productName,
+    orderUrl,
+    productImageUrl,
+  };
+}
+
+function parsePublicCatalogScript(source) {
+  if (!source) return [];
+
+  try {
+    const products = new Function(
+      "window",
+      source + "\nreturn Array.isArray(window.SCOOTSHOP_PRODUCTS) ? window.SCOOTSHOP_PRODUCTS : [];"
+    )({});
+    return Array.isArray(products) ? products : [];
+  } catch (e) {
+    console.error("parsePublicCatalogScript error:", e);
+    return [];
+  }
+}
+
+async function loadPublicCatalog() {
+  const now = Date.now();
+  if (publicCatalogCachePromise && publicCatalogCacheExpiresAt > now) {
+    return publicCatalogCachePromise;
+  }
+
+  publicCatalogCacheExpiresAt = now + PUBLIC_CATALOG_TTL_MS;
+  publicCatalogCachePromise = fetch(PUBLIC_CATALOG_URL, {
+    method: "GET",
+    headers: {
+      Accept: "application/javascript, text/javascript, text/plain",
+    },
+    cache: "no-store",
+  })
+    .then(async (response) => {
+      const text = await response.text();
+      if (!response.ok) {
+        console.error("loadPublicCatalog http error:", response.status, text.slice(0, 500));
+        return [];
+      }
+      return parsePublicCatalogScript(text);
+    })
+    .catch((e) => {
+      console.error("loadPublicCatalog fetch error:", e);
+      return [];
+    });
+
+  return publicCatalogCachePromise;
+}
+
+function resolvePublicProductFromCandidates(candidates, products) {
+  if (!Array.isArray(products) || !products.length) return null;
+
+  const normalizedProducts = products
+    .map((product) => {
+      const normalized = normalizeCatalogProduct(product);
+      if (!normalized) return null;
+
+      return {
+        raw: product,
+        normalized,
+        skuKey: compactKey(normalized.sku),
+        nameKey: compactKey(normalized.productName),
+        pathKey: compactKey(normalized.orderUrl),
+      };
+    })
+    .filter(Boolean);
 
   for (const raw of candidates) {
-    const code = resolveProductCode(raw);
-    if (code && PRODUCT_CATALOG[code]) {
-      return { ...PRODUCT_CATALOG[code], matchedBy: String(raw) };
+    const candidateCompact = compactKey(raw);
+    const candidatePath = compactKey(normalizePath(raw));
+
+    for (const product of normalizedProducts) {
+      if (
+        (product.skuKey && product.skuKey === candidateCompact) ||
+        (product.nameKey && product.nameKey === candidateCompact) ||
+        (product.pathKey && product.pathKey === candidatePath)
+      ) {
+        return { ...product.normalized, matchedBy: String(raw), source: "public_catalog" };
+      }
+    }
+  }
+
+  for (const raw of candidates) {
+    const candidateCompact = compactKey(raw);
+
+    for (const product of normalizedProducts) {
+      if (
+        (product.skuKey && candidateCompact.includes(product.skuKey)) ||
+        (product.nameKey && (candidateCompact.includes(product.nameKey) || product.nameKey.includes(candidateCompact)))
+      ) {
+        return { ...product.normalized, matchedBy: String(raw), source: "public_catalog" };
+      }
     }
   }
 
   return null;
+}
+
+function resolveLegacyProductFromCandidates(candidates) {
+  for (const raw of candidates) {
+    const code = resolveLegacyProductCode(raw);
+    if (code && LEGACY_PRODUCT_CATALOG[code]) {
+      return { ...LEGACY_PRODUCT_CATALOG[code], matchedBy: String(raw), source: "legacy_catalog" };
+    }
+  }
+
+  return null;
+}
+
+async function resolveProductFromOrder(order) {
+  const candidates = buildOrderCandidates(order);
+  if (!candidates.length) return null;
+
+  const publicProducts = await loadPublicCatalog();
+  const publicResolved = resolvePublicProductFromCandidates(candidates, publicProducts);
+  if (publicResolved) return publicResolved;
+
+  return resolveLegacyProductFromCandidates(candidates);
 }
 
 // --------------------
@@ -409,7 +550,7 @@ module.exports = async (req, res) => {
       return res.end("No buyer email");
     }
 
-    const resolved = resolveProductFromOrder(order);
+    const resolved = await resolveProductFromOrder(order);
     console.log("resolved product:", resolved?.productName || "NONE");
 
     const amountValue = order?.purchase_units?.[0]?.amount?.value;
