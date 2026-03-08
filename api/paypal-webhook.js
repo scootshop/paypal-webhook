@@ -1,5 +1,5 @@
 // api/paypal-webhook.js
-// Webhook PayPal (verifica firma) → obtiene email comprador → resuelve producto → envía email PRO con Resend
+// Webhook PayPal (verifica firma) -> obtiene email comprador -> resuelve producto -> envia email PRO con Resend
 // Compatible con:
 // - PAYMENT.CAPTURE.COMPLETED
 // - CHECKOUT.ORDER.COMPLETED
@@ -11,7 +11,7 @@ const { sendEmailResend } = require("../lib/email");
 // Helpers
 // --------------------
 function h(req, name) {
-  // Node/Vercel normaliza headers a minúsculas, pero por seguridad intentamos ambos
+  // Node/Vercel normaliza headers a minusculas, pero por seguridad intentamos ambos
   const k = String(name || "").toLowerCase();
   return req.headers?.[k] || req.headers?.[name] || null;
 }
@@ -103,7 +103,7 @@ async function verifyWebhook(baseUrl, accessToken, req, event) {
     webhook_event: event,
   };
 
-  // Si faltan headers críticos, no tiene sentido llamar a PayPal
+  // Si faltan headers criticos, no tiene sentido llamar a PayPal
   const required = ["auth_algo", "cert_url", "transmission_id", "transmission_sig", "transmission_time"];
   for (const k of required) {
     if (!payload[k]) {
@@ -179,6 +179,10 @@ function normKey(s) {
   return String(s || "").trim().toUpperCase();
 }
 
+function compactKey(s) {
+  return normKey(s).replace(/[^A-Z0-9]/g, "");
+}
+
 function absUrl(pathOrUrl) {
   if (!pathOrUrl) return "";
   if (pathOrUrl.startsWith("http")) return pathOrUrl;
@@ -198,6 +202,26 @@ const PRODUCT_CATALOG = Object.freeze({
     productName: "ZWheel MASCOOTER S4",
     orderUrl: "/patinetes/series-n/s4/",
     productImageUrl: "/patinetes/series-n/s4/img/1.jpg",
+  },
+  S3: {
+    productName: "S3-11",
+    orderUrl: "/patinetes/series-n/s3/",
+    productImageUrl: "/patinetes/series-n/s3/img/1.jpg",
+  },
+  VS6: {
+    productName: "VS6",
+    orderUrl: "/patinetes/series-n/vs6/",
+    productImageUrl: "/patinetes/series-n/vs6/img/1.jpg",
+  },
+  E8: {
+    productName: "TODIMART-SEEMAR E8",
+    orderUrl: "/patinetes/series-n/e8/",
+    productImageUrl: "/patinetes/series-n/e8/img/1.jpg",
+  },
+  G2PRO: {
+    productName: "KUKIRIN G2 PRO",
+    orderUrl: "/patinetes/series-k/g2-pro/",
+    productImageUrl: "/patinetes/series-k/g2-pro/img/1.jpg",
   },
   G2: {
     productName: "G2",
@@ -219,8 +243,13 @@ const PRODUCT_CATALOG = Object.freeze({
     orderUrl: "/patinetes/series-gt/t30/",
     productImageUrl: "/patinetes/series-gt/t30/img/1.jpg",
   },
+  GT9: {
+    productName: "GT9",
+    orderUrl: "/patinetes/series-gt/gt9/",
+    productImageUrl: "/patinetes/series-gt/gt9/img/1.jpg",
+  },
   IX3: {
-    productName: "IX3",
+    productName: "iScooter IX3",
     orderUrl: "/patinetes/series-ix/ix3/",
     productImageUrl: "/patinetes/series-ix/ix3/img/1.jpg",
   },
@@ -231,7 +260,69 @@ const PRODUCT_CATALOG = Object.freeze({
   },
 });
 
-const PRODUCT_CODES = Object.keys(PRODUCT_CATALOG);
+const PRODUCT_ALIASES = Object.freeze({
+  N7: "N7PRO",
+  N7PRO: "N7PRO",
+
+  S4: "S4",
+  "ZWHEEL MASCOOTER S4": "S4",
+
+  S3: "S3",
+  "S3-11": "S3",
+
+  VS6: "VS6",
+
+  E8: "E8",
+  "TODIMART-SEEMAR E8": "E8",
+
+  G2: "G2",
+
+  G2PRO: "G2PRO",
+  "G2 PRO": "G2PRO",
+  "KUKIRIN G2 PRO": "G2PRO",
+  "K-G2-PRO": "G2PRO",
+
+  T10: "T10",
+  TF3: "TF3",
+  T30: "T30",
+  GT9: "GT9",
+
+  IX3: "IX3",
+  "ISCOOTER IX3": "IX3",
+  "TODIMART-SEEMAR IX3": "IX3",
+
+  W9: "W9",
+});
+
+const PRODUCT_ALIASES_COMPACT = Object.freeze(
+  Object.fromEntries(
+    Object.entries(PRODUCT_ALIASES).map(([key, code]) => [compactKey(key), code])
+  )
+);
+
+const PRODUCT_CODES = Object.keys(PRODUCT_CATALOG).sort(
+  (a, b) => compactKey(b).length - compactKey(a).length
+);
+
+function resolveProductCode(raw) {
+  const exact = normKey(raw);
+  if (!exact) return null;
+
+  if (PRODUCT_CATALOG[exact]) return exact;
+  if (PRODUCT_ALIASES[exact]) return PRODUCT_ALIASES[exact];
+
+  const compact = compactKey(exact);
+  if (PRODUCT_CATALOG[compact]) return compact;
+  if (PRODUCT_ALIASES_COMPACT[compact]) return PRODUCT_ALIASES_COMPACT[compact];
+
+  for (const code of PRODUCT_CODES) {
+    if (compact.includes(compactKey(code))) {
+      return code;
+    }
+  }
+
+  return null;
+}
 
 // --------------------
 // Product resolver
@@ -249,17 +340,12 @@ function resolveProductFromOrder(order) {
     item0?.sku,
     item0?.name,
     pu.description,
-  ]
-    .filter(Boolean)
-    .map(normKey);
+  ].filter(Boolean);
 
-  for (const c of candidates) {
-    if (PRODUCT_CATALOG[c]) return { ...PRODUCT_CATALOG[c], matchedBy: c };
-  }
-
-  for (const c of candidates) {
-    for (const code of PRODUCT_CODES) {
-      if (c.includes(code)) return { ...PRODUCT_CATALOG[code], matchedBy: c };
+  for (const raw of candidates) {
+    const code = resolveProductCode(raw);
+    if (code && PRODUCT_CATALOG[code]) {
+      return { ...PRODUCT_CATALOG[code], matchedBy: String(raw) };
     }
   }
 
