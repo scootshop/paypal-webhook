@@ -1,4 +1,4 @@
-const { sendEmailResend, sendRawEmailResend } = require("../lib/email");
+const { sendEmailResend } = require("../lib/email");
 
 function readAuthBearer(req) {
   const header = req.headers?.authorization || "";
@@ -53,67 +53,50 @@ module.exports = async (req, res) => {
     const subject = String(body.subject || "").trim();
     const context = body.context && typeof body.context === "object" ? body.context : {};
 
+    if (event !== "payment.paid") {
+      res.statusCode = 400;
+      return res.end("Unsupported event");
+    }
+
     if (!orderId || !payerEmail) {
       res.statusCode = 400;
       return res.end("Missing orderId or payerEmail");
     }
 
-    // payment.paid → use the branded Resend template
-    if (event === "payment.paid") {
-      const productName = String(
-        context.productName ||
-        context.name ||
-        context.sku ||
-        "Pedido Scoot Shop"
-      ).trim();
+    const productName = String(
+      context.productName ||
+      context.name ||
+      context.sku ||
+      "Pedido Scoot Shop"
+    ).trim();
 
-      let amountValue = "";
-      if (typeof context.grossAmount === "string" && context.grossAmount.trim()) {
-        amountValue = context.grossAmount.trim();
-      } else if (Number.isFinite(context.amountTotal)) {
-        amountValue = (Number(context.amountTotal) / 100).toFixed(2);
-      }
-
-      const currencyCode = String(context.currency || "EUR").trim().toUpperCase();
-
-      const productImageUrl = normalizeUrl(
-        context.productImageUrl || body.productImageUrl || "/patinetes/series-ix/ix3/img/1.jpg"
-      );
-
-      const orderUrl = normalizeUrl(
-        context.orderUrl || body.orderUrl || "/pedido/"
-      );
-
-      await sendEmailResend({
-        to: payerEmail,
-        bcc: process.env.TEST_EMAIL_TO || undefined,
-        orderId,
-        productName,
-        amountValue,
-        currencyCode,
-        productImageUrl,
-        orderUrl,
-      });
-    } else {
-      // All other events (order.shipped, order.preparing, etc.)
-      // → relay the HTML/text provided by the PHP backend via Resend
-      const htmlBody = String(body.html || "").trim();
-      const textBody = String(body.text || "").trim();
-      const emailSubject = subject || `SCOOT SHOP — Actualización de pedido #${orderId}`;
-
-      if (!htmlBody && !textBody) {
-        res.statusCode = 400;
-        return res.end("Missing html or text body");
-      }
-
-      await sendRawEmailResend({
-        to: payerEmail,
-        bcc: process.env.TEST_EMAIL_TO || undefined,
-        subject: emailSubject,
-        html: htmlBody || undefined,
-        text: textBody,
-      });
+    let amountValue = "";
+    if (typeof context.grossAmount === "string" && context.grossAmount.trim()) {
+      amountValue = context.grossAmount.trim();
+    } else if (Number.isFinite(context.amountTotal)) {
+      amountValue = (Number(context.amountTotal) / 100).toFixed(2);
     }
+
+    const currencyCode = String(context.currency || "EUR").trim().toUpperCase();
+
+    const productImageUrl = normalizeUrl(
+      context.productImageUrl || body.productImageUrl || "/patinetes/series-ix/ix3/img/1.jpg"
+    );
+
+    const orderUrl = normalizeUrl(
+      context.orderUrl || body.orderUrl || "/pedido/"
+    );
+
+    await sendEmailResend({
+      to: payerEmail,
+      bcc: process.env.TEST_EMAIL_TO || undefined,
+      orderId,
+      productName,
+      amountValue,
+      currencyCode,
+      productImageUrl,
+      orderUrl,
+    });
 
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
