@@ -1,4 +1,4 @@
-const { sendEmailResend, sendRawEmailResend } = require("../lib/email");
+const { sendRawEmailResend } = require("../lib/email");
 
 function readAuthBearer(req) {
   const header = req.headers?.authorization || "";
@@ -24,13 +24,6 @@ async function readJson(req) {
   return raw ? JSON.parse(raw) : {};
 }
 
-function normalizeUrl(value, fallback = "https://scootshop.co/") {
-  const input = String(value || "").trim();
-  if (!input) return fallback;
-  if (/^https?:\/\//i.test(input)) return input;
-  return "https://scootshop.co" + (input.startsWith("/") ? input : "/" + input);
-}
-
 module.exports = async (req, res) => {
   try {
     if (req.method !== "POST") {
@@ -40,7 +33,10 @@ module.exports = async (req, res) => {
     }
 
     const bearer = readAuthBearer(req);
-    if (!process.env.VERCEL_EMAIL_BEARER_TOKEN || bearer !== process.env.VERCEL_EMAIL_BEARER_TOKEN) {
+    if (
+      !process.env.VERCEL_EMAIL_BEARER_TOKEN ||
+      bearer !== process.env.VERCEL_EMAIL_BEARER_TOKEN
+    ) {
       res.statusCode = 401;
       return res.end("Unauthorized");
     }
@@ -51,69 +47,30 @@ module.exports = async (req, res) => {
     const orderId = String(body.orderId || "").trim();
     const payerEmail = String(body.payerEmail || "").trim();
     const subject = String(body.subject || "").trim();
-    const context = body.context && typeof body.context === "object" ? body.context : {};
 
     if (!orderId || !payerEmail) {
       res.statusCode = 400;
       return res.end("Missing orderId or payerEmail");
     }
 
-    // payment.paid → use the branded Resend template
-    if (event === "payment.paid") {
-      const productName = String(
-        context.productName ||
-        context.name ||
-        context.sku ||
-        "Pedido Scoot Shop"
-      ).trim();
+    // All events (including payment.paid) relay the HTML/text from PHP backend
+    const htmlBody = String(body.html || "").trim();
+    const textBody = String(body.text || "").trim();
+    const emailSubject =
+      subject || `SCOOT SHOP — Actualización de pedido #${orderId}`;
 
-      let amountValue = "";
-      if (typeof context.grossAmount === "string" && context.grossAmount.trim()) {
-        amountValue = context.grossAmount.trim();
-      } else if (Number.isFinite(context.amountTotal)) {
-        amountValue = (Number(context.amountTotal) / 100).toFixed(2);
-      }
-
-      const currencyCode = String(context.currency || "EUR").trim().toUpperCase();
-
-      const productImageUrl = normalizeUrl(
-        context.productImageUrl || body.productImageUrl || "/patinetes/series-ix/ix3/img/1.jpg"
-      );
-
-      const orderUrl = normalizeUrl(
-        context.orderUrl || body.orderUrl || "/pedido/"
-      );
-
-      await sendEmailResend({
-        to: payerEmail,
-        bcc: process.env.TEST_EMAIL_TO || undefined,
-        orderId,
-        productName,
-        amountValue,
-        currencyCode,
-        productImageUrl,
-        orderUrl,
-      });
-    } else {
-      // All other events (order.shipped, order.preparing, etc.)
-      // → relay the HTML/text provided by the PHP backend via Resend
-      const htmlBody = String(body.html || "").trim();
-      const textBody = String(body.text || "").trim();
-      const emailSubject = subject || `SCOOT SHOP — Actualización de pedido #${orderId}`;
-
-      if (!htmlBody && !textBody) {
-        res.statusCode = 400;
-        return res.end("Missing html or text body");
-      }
-
-      await sendRawEmailResend({
-        to: payerEmail,
-        bcc: process.env.TEST_EMAIL_TO || undefined,
-        subject: emailSubject,
-        html: htmlBody || undefined,
-        text: textBody,
-      });
+    if (!htmlBody && !textBody) {
+      res.statusCode = 400;
+      return res.end("Missing html or text body");
     }
+
+    await sendRawEmailResend({
+      to: payerEmail,
+      bcc: process.env.TEST_EMAIL_TO || undefined,
+      subject: emailSubject,
+      html: htmlBody || undefined,
+      text: textBody,
+    });
 
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
