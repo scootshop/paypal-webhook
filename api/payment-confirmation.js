@@ -70,6 +70,9 @@ module.exports = async (req, res) => {
       subject: emailSubject,
       html: htmlBody || undefined,
       text: textBody,
+      // Vacios en todos los correos salvo los que piden remitente propio (garantias).
+      from: body.mailFromOverride,
+      replyTo: body.replyTo,
     });
 
     res.statusCode = 200;
