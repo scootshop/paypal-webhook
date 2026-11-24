@@ -73,6 +73,8 @@ module.exports = async (req, res) => {
       // Vacios en todos los correos salvo los que piden remitente propio (garantias).
       from: body.mailFromOverride,
       replyTo: body.replyTo,
+      // El PDF del recibo (24 nov 2026). Se filtra en lib/email.js.
+      attachments: body.attachments,
     });
 
     res.statusCode = 200;
